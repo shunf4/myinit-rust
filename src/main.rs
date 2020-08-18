@@ -14,10 +14,14 @@ extern crate validator;
 #[macro_use] extern crate lazy_static;
 extern crate enum_as_inner;
 extern crate dynfmt;
+extern crate flate2;
 
+use std::io::prelude::*;
+use std::fs::File;
 use std::rc::Rc;
 use std::fmt::Debug;
 use std::convert::TryInto;
+use std::path::Path;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::string::String;
@@ -32,6 +36,7 @@ use simple_error::SimpleError;
 use log::Level;
 use enum_as_inner::EnumAsInner;
 use dynfmt::Format;
+use flate2::read::GzDecoder;
 
 mod curly_modified;
 
@@ -56,6 +61,12 @@ impl std::fmt::Display for VarValue {
 }
 
 enum AskEnum<'a> { Box(Box<String>), Ref(&'a String) }
+
+enum EntrySelector {
+    None,
+    Id(String),
+    IdPrefix(String),
+}
 
 #[derive(Serialize, Deserialize, Debug, Validate, Default)]
 struct VarStruct {
@@ -579,7 +590,7 @@ impl MyInitExecution {
 
                 for file in files.iter() {
                     let archive_path = 
-                        std::path::Path::new(&self.resolve_var(
+                        Path::new(&self.resolve_var(
                             &format!("{}/{}/{}", &entry.id, &file.name, "archiveDir"),
                             &file.archive_dir,
                             Some(&entry),
@@ -591,28 +602,89 @@ impl MyInitExecution {
             }
         }
     }
+
+    fn load_archive(&self, archive_path: &str) -> (tar::Archive<File>, ) {
+        // let file = File::open(archive_path).unwrap();
+        // let de_gzip = GzDecoder::new(file);
+        let mut archive = tar::Archive::new(File::open(archive_path).unwrap());
+
+        for e in archive.entries().unwrap() {
+            println!("{:?}", e.unwrap().path().unwrap());
+        }
+
+        let mut archive = tar::Archive::new(File::open(archive_path).unwrap());
+
+        let f = archive.entries().unwrap().map(|e| e.unwrap().path().unwrap().to_str().unwrap().to_owned()).find(|s| s == "config.yaml");
+
+        let mut archive = tar::Archive::new(File::open(archive_path).unwrap());
+
+        let c =
+            archive.entries()
+                .unwrap()
+                .collect::<Result<Vec<tar::Entry<_>>, _>>()
+                .unwrap()
+                .iter()
+                .map(|e| e.path()
+                    .map_err(
+                        |err| SimpleError::new(&format!("{:?}", err))
+                    ).and_then(
+                        |p| p.to_str().ok_or(SimpleError::new("can't convert path to string")).map(|s| s.to_owned())
+                    ).map(
+                        |s| s.to_owned()
+                    )
+                )
+                .collect::<Result<Vec<String>, _>>();
+
+        println!("{:#?}", &f);
+        println!("{:#?}", &c);
+
+        let mut archive = tar::Archive::new(File::open(archive_path).unwrap());
+
+        (archive, )
+    }
+
+    fn unpack(&self, archive_path: &str, entry_selector: Option<&str>) -> Result<(), SimpleError> {
+        let selector = match entry_selector {
+            Some(some_entry_selector) => {
+                if some_entry_selector.len() == 0 {
+                    return Err(SimpleError::new("entry selector is an empty string"));
+                }
+
+                if some_entry_selector.chars().last().unwrap() == '/' {
+                    EntrySelector::IdPrefix(some_entry_selector.to_owned())
+                } else {
+                    EntrySelector::Id(some_entry_selector.to_owned())
+                }
+            },
+            None => EntrySelector::None
+        };
+
+        Ok(())
+    }
 }
 
 fn main() {
     //MyInitExecution::new().print(&vec![&(String::from("Hello world!"))]);
     env_logger::init();
-    let mut yaml: serde_yaml::Value = serde_yaml::from_reader(std::fs::File::open("config.yaml").unwrap()).unwrap();
+    let mut yaml: serde_yaml::Value = serde_yaml::from_reader(File::open("config.yaml").unwrap()).unwrap();
     let mut config: MyInitConfig = serde_yaml::from_value(yaml).unwrap();
     let mut mie = MyInitExecution::new();
 
     mie.process_config(&mut config);
 
-    println!("{:#?}", &config.entries[1].borrow());
+    mie.load_archive("./riv_conf.5.tar");
 
-    println!("{:#?}", mie.resolve_var("&config.entries[1].files.unwrap()[0].archive_dir", &config.entries[1].borrow().files.as_ref().unwrap()[0].archive_dir, Some(&config.entries[1].borrow()), &config, 0));
+    // println!("{:#?}", &config.entries[1].borrow());
 
-    println!("{:#?}", mie.resolve_var("&config.entries[1].files.unwrap()[1].archive_dir", &config.entries[1].borrow().files.as_ref().unwrap()[1].archive_dir, Some(&config.entries[1].borrow()), &config, 0));
+    // println!("{:#?}", mie.resolve_var("&config.entries[1].files.unwrap()[0].archive_dir", &config.entries[1].borrow().files.as_ref().unwrap()[0].archive_dir, Some(&config.entries[1].borrow()), &config, 0));
 
-    println!("{:#?}", mie.resolve_var("&config.entries[0].command.as_ref().unwrap()", &config.entries[0].borrow().command.as_ref().unwrap(), Some(&config.entries[0].borrow()), &config, 0));
+    // println!("{:#?}", mie.resolve_var("&config.entries[1].files.unwrap()[1].archive_dir", &config.entries[1].borrow().files.as_ref().unwrap()[1].archive_dir, Some(&config.entries[1].borrow()), &config, 0));
 
-    println!("{:#?}", mie.resolve_var("&config.entries[2].command.as_ref().unwrap()", &config.entries[2].borrow().command.as_ref().unwrap(), Some(&config.entries[2].borrow()), &config, 0));
+    // println!("{:#?}", mie.resolve_var("&config.entries[0].command.as_ref().unwrap()", &config.entries[0].borrow().command.as_ref().unwrap(), Some(&config.entries[0].borrow()), &config, 0));
 
-    println!("{:#?}", mie.resolve_var("&config.entries[15].command.as_ref().unwrap()", &config.entries[15].borrow().command.as_ref().unwrap(), Some(&config.entries[15].borrow()), &config, 0));
+    // println!("{:#?}", mie.resolve_var("&config.entries[2].command.as_ref().unwrap()", &config.entries[2].borrow().command.as_ref().unwrap(), Some(&config.entries[2].borrow()), &config, 0));
+
+    // println!("{:#?}", mie.resolve_var("&config.entries[15].command.as_ref().unwrap()", &config.entries[15].borrow().command.as_ref().unwrap(), Some(&config.entries[15].borrow()), &config, 0));
 
     // println!("ask() Return: {}", mie.ask("_", "prompt", &vec![
     //     "yes",

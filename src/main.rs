@@ -1,21 +1,3 @@
-extern crate regex;
-extern crate yaml_rust;
-extern crate users;
-extern crate colour;
-extern crate console;
-extern crate dialoguer;
-extern crate simple_error;
-#[macro_use] extern crate log;
-#[macro_use] extern crate serde;
-#[macro_use] extern crate serde_yaml;
-#[macro_use] extern crate serde_json;
-#[macro_use] extern crate validator_derive;
-extern crate validator;
-#[macro_use] extern crate lazy_static;
-extern crate enum_as_inner;
-extern crate dynfmt;
-extern crate flate2;
-
 use std::io::prelude::*;
 use std::fs::File;
 use std::rc::Rc;
@@ -33,175 +15,20 @@ use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError, ValidationErrors};
 use regex::Regex;
 use simple_error::SimpleError;
+use log::{info, debug};
 use log::Level;
 use enum_as_inner::EnumAsInner;
 use dynfmt::Format;
 use flate2::read::GzDecoder;
+use var::{Entry, EntrySelector, Var, VarValue, VarStruct};
+use config::MyInitConfig;
 
 mod curly_modified;
-
-#[derive(Serialize, Deserialize, Clone, Debug, EnumAsInner)]
-#[serde(untagged)]
-enum VarValue {
-    String(String),
-    Bool(bool),
-    Int(u64),
-    Real(f64),
-}
-
-impl std::fmt::Display for VarValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VarValue::String(s) => write!(f, "{}", s),
-            VarValue::Bool(b) => write!(f, "{}", b),
-            VarValue::Int(i) => write!(f, "{}", i),
-            VarValue::Real(r) => write!(f, "{}", r),
-        }
-    }
-}
+mod var;
+mod config;
+mod archive;
 
 enum AskEnum<'a> { Box(Box<String>), Ref(&'a String) }
-
-enum EntrySelector {
-    None,
-    Id(String),
-    IdPrefix(String),
-}
-
-#[derive(Serialize, Deserialize, Debug, Validate, Default)]
-struct VarStruct {
-    #[serde(rename = "value")]
-    imm_value: Option<VarValue>,
-
-    #[serde(rename = "defaultValue")]
-    default_value: Option<VarValue>,
-
-    #[serde(rename = "refVar")]
-    ref_var: Option<String>,
-
-    description: Option<String>,
-
-    #[serde(rename = "doNotFormat", default = "VarStruct::do_not_format_default")]
-    do_not_format: bool,
-
-    #[serde(skip)]
-    final_value: RefCell<Option<VarValue>>,
-}
-
-impl VarStruct {
-    fn do_not_format_default() -> bool { false }
-}
-
-#[derive(Serialize, Deserialize, Debug, EnumAsInner)]
-#[serde(untagged)]
-enum Var {
-    VarStruct(VarStruct),
-    ImmValue(VarValue),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-enum EntryFileMode {
-    Octal(u64),
-    String(String),
-}
-
-lazy_static! {
-    static ref RE_ENTRY_TYPE: Regex = Regex::new(r#"\A(command|file)\z"#).unwrap();
-    static ref RE_ENTRY_EXPECT_WHEN_UNPACK: Regex = Regex::new(r#"\A(notExist|exist|none)\z"#).unwrap();
-}
-
-#[derive(Serialize, Deserialize, Debug, Validate)]
-struct EntryFile {
-    #[validate(length(min = 1))]
-    name: String,
-
-    #[serde(rename = "archiveDir")]
-    archive_dir: Var,
-
-    #[serde(rename = "systemDir")]
-    system_dir: Var,
-
-    #[validate(length(min = 1))]
-    owner: Option<String>,
-
-    mode: Option<EntryFileMode>,
-
-    #[validate(regex = "RE_ENTRY_EXPECT_WHEN_UNPACK")]
-    #[serde(rename = "expectWhenUnpack", default = "EntryFile::expect_when_unpack_default")]
-    expect_when_unpack: String
-}
-
-impl EntryFile {
-    fn expect_when_unpack_default() -> String { String::from("none") }
-}
-
-fn validate_files(files: &Vec<EntryFile>) -> Result<(), ValidationError> {
-    files.iter()
-        .map(|ef| ef.validate())
-        .collect::<Result<Vec<_>, _>>()
-        .map(|_| ())
-        .map_err(|err| ValidationError::new("One EntryFile is invalid"))
-}
-
-#[derive(Serialize, Deserialize, Debug, Validate)]
-struct Entry {
-    #[validate(length(min = 1))]
-    name: Option<String>,
-
-    #[validate(length(min = 1))]
-    id: String,
-
-    #[validate(regex = "RE_ENTRY_TYPE")]
-    #[serde(rename = "type")]
-    type_: String,
-
-    #[serde(rename = "shouldAskForConfirm", default = "Entry::should_ask_for_confirm_default")]
-    should_ask_for_confirm: bool,
-
-    command: Option<Var>,
-
-    #[validate(custom = "validate_files")]
-    files: Option<Vec<EntryFile>>,
-
-    #[validate(length(min = 1))]
-    #[serde(rename = "asUser")]
-    as_user: Option<String>,
-
-    #[serde(rename = "varDict")]
-    var_mapping: Option<HashMap<String, Var>>,
-
-    #[serde(skip)]
-    archive_path_set: RefCell<std::collections::HashSet<String>>,
-}
-
-impl Entry {
-    fn should_ask_for_confirm_default() -> bool { false }
-}
-
-#[derive(Serialize, Deserialize, Debug, Validate)]
-struct MyInitConfig {
-    #[serde(rename = "specVersion")]
-    spec_version: u64,
-
-    #[serde(rename = "confVersion")]
-    conf_version: u64,
-
-    #[validate(length(min = 1))]
-    id: String,
-
-    #[serde(rename = "expectAsUser")]
-    #[validate(length(min = 1))]
-    expect_as_user: Option<String>,
-
-    #[serde(rename = "commonVarDict")]
-    common_var: HashMap<String, Var>,
-
-    entries: Vec<Rc<RefCell<Entry>>>,
-
-    #[serde(skip)]
-    entries_mapping: HashMap<String, Rc<RefCell<Entry>>>,
-}
 
 struct MyInitExecution {
     consts: HashMap<String, Var>,
@@ -603,44 +430,51 @@ impl MyInitExecution {
         }
     }
 
-    fn load_archive(&self, archive_path: &str) -> (tar::Archive<File>, ) {
-        // let file = File::open(archive_path).unwrap();
-        // let de_gzip = GzDecoder::new(file);
-        let mut archive = tar::Archive::new(File::open(archive_path).unwrap());
+    fn load_archive(&self, archive_path: &str) -> () {
+        let file = File::open(archive_path).unwrap();
+        let file_refcell = RefCell::new(file);
 
-        for e in archive.entries().unwrap() {
-            println!("{:?}", e.unwrap().path().unwrap());
+        {
+            let ref mut file = *file_refcell.borrow_mut();
+            // let de_gzip = GzDecoder::new(file);
+            let mut archive = tar::Archive::new(file);
+
+            for e in archive.entries().unwrap() {
+                println!("{:?}", e.unwrap().path().unwrap());
+            }
         }
 
-        let mut archive = tar::Archive::new(File::open(archive_path).unwrap());
+        {
+            let ref mut file = *file_refcell.borrow_mut();
+            let mut archive = tar::Archive::new(file);
 
-        let f = archive.entries().unwrap().map(|e| e.unwrap().path().unwrap().to_str().unwrap().to_owned()).find(|s| s == "config.yaml");
+            let f = archive.entries().unwrap().map(|e| e.unwrap().path().unwrap().to_str().unwrap().to_owned()).find(|s| s == "config.yaml");
+            println!("{:#?}", &f);
+        }
 
-        let mut archive = tar::Archive::new(File::open(archive_path).unwrap());
+        {
+            let ref mut file = *file_refcell.borrow_mut();
+            let mut archive = tar::Archive::new(file);
 
-        let c =
-            archive.entries()
-                .unwrap()
-                .collect::<Result<Vec<tar::Entry<_>>, _>>()
-                .unwrap()
-                .iter()
-                .map(|e| e.path()
-                    .map_err(
-                        |err| SimpleError::new(&format!("{:?}", err))
-                    ).and_then(
-                        |p| p.to_str().ok_or(SimpleError::new("can't convert path to string")).map(|s| s.to_owned())
-                    ).map(
-                        |s| s.to_owned()
+            let c =
+                archive.entries()
+                    .unwrap()
+                    .collect::<Result<Vec<tar::Entry<_>>, _>>()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.path()
+                        .map_err(
+                            |err| SimpleError::new(&format!("{:?}", err))
+                        ).and_then(
+                            |p| p.to_str().ok_or(SimpleError::new("can't convert path to string")).map(|s| s.to_owned())
+                        ).map(
+                            |s| s.to_owned()
+                        )
                     )
-                )
-                .collect::<Result<Vec<String>, _>>();
+                    .collect::<Result<Vec<String>, _>>();
 
-        println!("{:#?}", &f);
-        println!("{:#?}", &c);
-
-        let mut archive = tar::Archive::new(File::open(archive_path).unwrap());
-
-        (archive, )
+            println!("{:#?}", &c);
+        }
     }
 
     fn unpack(&self, archive_path: &str, entry_selector: Option<&str>) -> Result<(), SimpleError> {
@@ -672,7 +506,28 @@ fn main() {
 
     mie.process_config(&mut config);
 
-    mie.load_archive("./riv_conf.5.tar");
+    {
+        let file = File::open("./riv_conf.5.tar.gz").unwrap();
+        let a = archive::MyInitArchive::new(file);
+
+        let mut x = a.tar();
+        
+        {
+            let mut y: tar::Archive<_> = x.get();
+            for e in y.entries().unwrap() {
+                println!("{:?}", e.unwrap().path().unwrap());
+            }
+        }
+
+        {
+            let mut y: tar::Archive<flate2::read::GzDecoder<&mut std::fs::File>> = &mut x;
+            for e in y.entries().unwrap() {
+                println!("{:?}", e.unwrap().path().unwrap());
+            }
+        }
+    };
+    
+    // mie.load_archive("./riv_conf.5.tar.gz");
 
     // println!("{:#?}", &config.entries[1].borrow());
 

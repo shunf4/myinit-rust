@@ -5,53 +5,90 @@ use tar::{Archive, Builder};
 use std::fs::File;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use std::ops::Deref;
-use std::ops::DerefMut;
-use std::convert::Into;
+use simple_error::SimpleError;
+use std::path::Path;
+
+use crate::util::to_simple_err;
 
 pub struct MyInitArchive {
-    inner: RefCell<File>,
+    inner: File,
 }
 
-pub struct LiveArchive<'a> {
-    inner_file: RefMut<'a, File>,
-}
-
-impl<'a, 'b> LiveArchive<'a> {
-    pub fn get(&'b mut self) -> Archive<GzDecoder<&'b mut File>> {
-        self.inner_file.seek(std::io::SeekFrom::Start(0)).unwrap();
-
-        Archive::new(
-            GzDecoder::new(
-                &mut *self.inner_file
-            )
-        )
-    }
-}
-
-impl<'a, 'b> Into<Archive<GzDecoder<&'b mut File>>> for &'b mut LiveArchive<'a> {
-    fn into(self) -> Archive<GzDecoder<&'b mut File>> {
-        self.inner_file.seek(std::io::SeekFrom::Start(0)).unwrap();
-
-        Archive::new(
-            GzDecoder::new(
-                &mut *((*self).inner_file)
-            )
-        )
-    }
+pub struct MyInitLiveArchive<'a> {
+    inner: Archive<GzDecoder<&'a mut File>>,
 }
 
 impl MyInitArchive {
     pub fn new(inner_file: File) -> Self {
         MyInitArchive {
-            inner: RefCell::new(inner_file),
+            inner: inner_file,
         }
     }
 
-    pub fn tar<'a, 'b>(&'a self) -> LiveArchive<'b> where 'a: 'b {
-        let file_ref_mut = self.inner.borrow_mut();
-        LiveArchive {
-            inner_file: file_ref_mut,
-        }
+    pub fn tar(&mut self) -> Result<MyInitLiveArchive, SimpleError> {
+        self.inner.seek(std::io::SeekFrom::Start(0))
+            .map_err(to_simple_err)?;
+
+        Ok(MyInitLiveArchive {
+            inner:
+                Archive::new(
+                    GzDecoder::new(
+                        &mut self.inner
+                    )
+                )
+        })
     }
 }
+
+impl<'a> MyInitLiveArchive<'a> {
+    pub fn inner_mut(&mut self) -> &mut Archive<GzDecoder<&'a mut File>> {
+        &mut self.inner
+    }
+
+    pub fn to_entry_path_list(&mut self) -> Result<Vec<String>, SimpleError> {
+        self
+            .inner
+            .entries()
+            .map_err(to_simple_err)?
+            .map(|e| e
+                .map_err(to_simple_err)
+                .and_then(|e| e
+                    .path()
+                    .map(|p| p.into_owned())
+                    .map_err(to_simple_err)
+                )
+                .and_then(|p| p
+                    .to_str()
+                    .ok_or(SimpleError::new("can't convert path to string"))
+                    .map(|s| s.to_owned())
+                )
+            ).collect::<Result<Vec<String>, _>>()
+    }
+
+    pub fn to_entry_with_path<'b>(&mut self, path: &'b Path) -> Result<tar::Entry<GzDecoder<&'a mut File>>, SimpleError> {
+        Ok(self
+            .inner
+            .entries()
+            .map_err(to_simple_err)?
+            .find(|e| {
+                let result_eq = e.as_ref()
+                    .map_err(to_simple_err)
+                    .and_then(|e| e
+                        .path()
+                        .map(|p| p.into_owned())
+                        .map_err(to_simple_err)
+                    )
+                    .map(|p| p == path
+                    );
+
+                match result_eq {
+                    Ok(b) => b,
+                    Err(_) => false,
+                }
+            })
+            .ok_or(SimpleError::new("not found"))?
+            .unwrap()
+        )
+    }
+}
+

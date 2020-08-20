@@ -3,7 +3,7 @@ use std::fs::File;
 use std::rc::Rc;
 use std::fmt::Debug;
 use std::convert::TryInto;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::string::String;
@@ -20,13 +20,19 @@ use log::Level;
 use enum_as_inner::EnumAsInner;
 use dynfmt::Format;
 use flate2::read::GzDecoder;
-use var::{Entry, EntrySelector, Var, VarValue, VarStruct};
+use var::{Entry, EntrySelector, Var, VarValue, VarStruct, EntryFileMode};
 use config::MyInitConfig;
+use archive::MyInitArchive;
+use util::to_simple_err;
+use nix::unistd;
+use std::process;
+use std::os::unix::process::ExitStatusExt;
 
 mod curly_modified;
 mod var;
 mod config;
 mod archive;
+mod util;
 
 enum AskEnum<'a> { Box(Box<String>), Ref(&'a String) }
 
@@ -107,11 +113,6 @@ impl MyInitExecution {
         );
 
         mie
-    }
-
-    fn print(&self, arg1: &Vec<&dyn AsRef<str>>) {
-        println!("{}", arg1.get(0).unwrap().as_ref());
-        println!("{:#?}", self);
     }
 
     fn ask(&self, storage_token: &str, prompt: &str, opts: &Vec<&str>) -> String {
@@ -222,12 +223,8 @@ impl MyInitExecution {
 
         let mut replacements: Vec<(usize, usize, String)> = Vec::new();
 
-        for fmt_arg in curly_modified::SimpleCurlyModifiedFormat.iter_args(string_to_format.as_str()).map_err(|err| {
-            SimpleError::new(format!("{:?}", err))
-        })? {
-            let fmt_arg = fmt_arg.map_err(|err| {
-                SimpleError::new(format!("{:?}", err))
-            })?;
+        for fmt_arg in curly_modified::SimpleCurlyModifiedFormat.iter_args(string_to_format.as_str()).map_err(to_simple_err)? {
+            let fmt_arg = fmt_arg.map_err(to_simple_err)?;
             let (start, end) = (fmt_arg.start(), fmt_arg.end());
             let mut arg_chars: Vec<char> = (&string_to_format[start..end]).chars().collect();
             assert_eq!(arg_chars.remove(0), '{');
@@ -403,6 +400,18 @@ impl MyInitExecution {
         Ok(value)
     }
 
+    fn is_dry_run(&self, entry: Option<&Entry>, config: &MyInitConfig) -> Result<bool, SimpleError> {
+        Ok(bool::from(self.resolve_var("DryRun",
+            &Var::VarStruct(VarStruct {
+                ref_var: Some("DryRun".to_owned()),
+                do_not_format: true,
+                ..Default::default()
+            }),
+            entry,
+            config,
+            1)?))
+    }
+
     fn process_config(&self, config: &mut MyInitConfig) {
         config.entries_mapping.clear();
         for entry_rc_refcell in config.entries.iter() {
@@ -418,7 +427,7 @@ impl MyInitExecution {
                 for file in files.iter() {
                     let archive_path = 
                         Path::new(&self.resolve_var(
-                            &format!("{}/{}/{}", &entry.id, &file.name, "archiveDir"),
+                            &format!("{}/{}:archiveDir", &entry.id, &file.name),
                             &file.archive_dir,
                             Some(&entry),
                             &config,
@@ -430,50 +439,44 @@ impl MyInitExecution {
         }
     }
 
-    fn load_archive(&self, archive_path: &str) -> () {
-        let file = File::open(archive_path).unwrap();
-        let file_refcell = RefCell::new(file);
+    fn read_config(&self, archive_path: &str) -> Result<(MyInitConfig, MyInitArchive), SimpleError> {
+        let mut archive = MyInitArchive::new(
+            File::open(archive_path).map_err(to_simple_err)?
+        );
 
-        {
-            let ref mut file = *file_refcell.borrow_mut();
-            // let de_gzip = GzDecoder::new(file);
-            let mut archive = tar::Archive::new(file);
+        Ok((
+            MyInitConfig::try_from(archive.tar()?.to_entry_with_path(Path::new("config.yaml"))?)?,
+            archive,
+        ))
+    }
 
-            for e in archive.entries().unwrap() {
-                println!("{:?}", e.unwrap().path().unwrap());
+    fn load_archive(&self, archive_path: &str) -> Result<(MyInitConfig, MyInitArchive), SimpleError> {
+        let mut archive = MyInitArchive::new(
+            File::open(archive_path).map_err(to_simple_err)?
+        );
+
+        Ok((
+            serde_yaml::from_reader(archive.tar()?.to_entry_with_path(Path::new("config.yaml"))?).map_err(to_simple_err)?,
+            archive,
+        ))
+    }
+
+    fn check_current_user(&self, config: &MyInitConfig) {
+        if let Some(expected_user_name) = &config.expect_as_user {
+            let current_user_name = self.consts.get("CurrentUser").unwrap().as_imm_value().unwrap().to_string();
+            if *expected_user_name != current_user_name {
+                if self.ask(
+                    "incorrect_user",
+                    &format!("This Configuration expects you to be user {}, but you are currently user {}. Continue?", expected_user_name, &current_user_name),
+                    &vec![
+                        "yes",
+                        "no",
+                        "exit",
+                    ]
+                ) != "yes" {
+                    std::process::exit(1);
+                }
             }
-        }
-
-        {
-            let ref mut file = *file_refcell.borrow_mut();
-            let mut archive = tar::Archive::new(file);
-
-            let f = archive.entries().unwrap().map(|e| e.unwrap().path().unwrap().to_str().unwrap().to_owned()).find(|s| s == "config.yaml");
-            println!("{:#?}", &f);
-        }
-
-        {
-            let ref mut file = *file_refcell.borrow_mut();
-            let mut archive = tar::Archive::new(file);
-
-            let c =
-                archive.entries()
-                    .unwrap()
-                    .collect::<Result<Vec<tar::Entry<_>>, _>>()
-                    .unwrap()
-                    .iter()
-                    .map(|e| e.path()
-                        .map_err(
-                            |err| SimpleError::new(&format!("{:?}", err))
-                        ).and_then(
-                            |p| p.to_str().ok_or(SimpleError::new("can't convert path to string")).map(|s| s.to_owned())
-                        ).map(
-                            |s| s.to_owned()
-                        )
-                    )
-                    .collect::<Result<Vec<String>, _>>();
-
-            println!("{:#?}", &c);
         }
     }
 
@@ -493,6 +496,279 @@ impl MyInitExecution {
             None => EntrySelector::None
         };
 
+        let (mut config, mut archive) =
+        self.load_archive("./riv_conf.5.tar.gz")?;
+
+        // 0. Check current user
+        self.check_current_user(&config);
+
+        // 1. Check if there is currently another version installed in system
+        let workspace_dir_var = config.common_var.get("WorkspaceDir").ok_or(SimpleError::new("No variable WorkspaceDir found in CommonVarDict"))?;
+
+        let workspace_dir_path = self.resolve_var(
+            "commonVarDict/WorkspaceDir",
+            workspace_dir_var,
+            None,
+            &config,
+            0
+        )?.to_string();
+            
+        let workspace_dir_path = Path::new(&workspace_dir_path);
+        let workspace_conf_path = workspace_dir_path.join("config.yaml");
+        
+        // 1.1 Check existence of workspace directory
+        if !self.is_dry_run(None, &config)? {
+            if !workspace_dir_path.is_dir() {
+                debug!("creating dir {}...", workspace_dir_path.to_string_lossy());
+                std::fs::create_dir_all(workspace_dir_path).map_err(to_simple_err)?;
+            }
+        } else {
+            println!("dry: created dir {}", workspace_dir_path.to_string_lossy());
+        }
+
+        // 1.2 Check existence of workspace config
+        let mut workspace_conf_not_accessable = false;
+        let mut workspace_conf_is_file = false;
+        let mut workspace_conf_exists = false;
+        if let Err(err) = workspace_conf_path.metadata() {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                workspace_conf_not_accessable = true;
+            }
+        }
+
+        if !workspace_conf_not_accessable {
+            if workspace_conf_path.exists() {
+                workspace_conf_exists = true;
+            }
+
+            if workspace_conf_path.is_file() {
+                workspace_conf_is_file = true;
+            }
+        }
+
+        if workspace_conf_not_accessable || workspace_conf_exists && !workspace_conf_is_file {
+            if self.ask(
+                "_",
+                &format!("{} is not a file or cannot be accessed, so myinit cannot detect whether there is another myinit archive unpacked in your system. If you continue, current archive will forcibly unpack files in your system. Continue?", workspace_conf_path.to_string_lossy()),
+                &vec!["yes", "no", "exit"],
+            ) != "yes" {
+                std::process::exit(1);
+            }
+        }
+
+        // 1.3 Load existing config and archive
+        let mut existing_config: Option<MyInitConfig> = None;
+        let mut existing_archive: Option<MyInitArchive> = None;
+        if !workspace_conf_not_accessable && workspace_conf_exists && workspace_conf_is_file {
+            existing_config = Some(MyInitConfig::try_from(File::open(workspace_conf_path).map_err(to_simple_err)?)?);
+            let existing_archive_path = workspace_dir_path.join(existing_config.as_ref().unwrap().make_archive_filename());
+
+            if !existing_archive_path.is_file() {
+                if self.ask(
+                    "_",
+                    &format!("{} is not a file or cannot be accessed, so myinit cannot detect whether there is another myinit archive unpacked in your system. If you continue, current archive will forcibly unpack files in your system. Continue?", existing_archive_path.to_string_lossy()),
+                    &vec!["yes", "no", "exit"],
+                ) != "yes" {
+                    std::process::exit(1);
+                }
+                existing_config = None;
+            } else {
+                existing_archive = Some(MyInitArchive::new(
+                    File::open(existing_archive_path).map_err(to_simple_err)?
+                ));
+            }
+        }
+
+        // 2. Execute entries
+        for entry in config.entries.iter() {
+            // 2.1 Check filter
+            let entry: &Entry = &entry.borrow();
+            if let EntrySelector::Id(ref entry_id) = selector {
+                if entry.id != *entry_id {
+                    debug!("{} does not match the id filter {}, continue", entry.name_for_human(), entry_id);
+                    continue;
+                }
+            } else if let EntrySelector::IdPrefix(ref entry_id_prefix) = selector {
+                if !entry.id.starts_with(entry_id_prefix) {
+                    debug!("{} does not match the id prefix filter {}, continue", entry.name_for_human(), entry_id_prefix);
+                    continue;
+                }
+            }
+
+            debug!("executing entry {}", entry.name_for_human());
+
+            // 2.2 Ask for confirm
+            println!("\n=======\nentry: {}", entry.name_for_human());
+            if entry.should_ask_for_confirm {
+                if self.ask(
+                    "entry_ask_for_confirm",
+                    &format!("{}: apply this entry?", entry.name_for_human()),
+                    &vec!["yes", "no", "exit"]
+                ) == "no" {
+                    continue;
+                }
+            }
+
+            if entry.type_ == "command" {
+                // 2.3.1 Execute command
+                debug!("entry is command");
+
+                let command_var = entry.command.as_ref().ok_or(SimpleError::new(&format!("command not found in entry {}", entry.id)))?;
+                let command = self.resolve_var(
+                    &format!("{}:command", entry.id),
+                    command_var,
+                    Some(entry),
+                    &config,
+                    1
+                )?.to_string();
+
+                println!("running entry command");
+                if !self.is_dry_run(Some(entry), &config)? {
+                    let tmp_dir = tempfile::tempdir().unwrap();
+                    let tmp_fifo_path = tmp_dir.path().to_owned().join("fifo");
+                    nix::unistd::mkfifo(
+                        &tmp_fifo_path,
+                        nix::sys::stat::Mode::S_IRWXU | nix::sys::stat::Mode::S_IRWXG | nix::sys::stat::Mode::S_IRWXO
+                    ).map_err(to_simple_err)?;
+                    let mut bash_process: process::Child;
+
+                    if entry.as_user.is_none() || *entry.as_user.as_ref().unwrap() == self.consts["CurrentUser"].as_imm_value().unwrap().to_string() {
+                        bash_process = process::Command::new("bash").arg("-i").arg("-l").arg(&tmp_fifo_path).env("SHLVL", "2").spawn().map_err(to_simple_err)?;
+                    } else {
+                        bash_process = process::Command::new("sudo").arg("-u").arg(entry.as_user.as_ref().unwrap()).arg("-i").arg("SHLVL=2").arg("bash").arg("-i").arg("-l").arg(&tmp_fifo_path).env("SHLVL", "2").spawn().map_err(to_simple_err)?;
+                    }
+
+                    {
+                        let mut tmp_fifo: File = std::fs::OpenOptions::new().write(true).open(&tmp_fifo_path).map_err(to_simple_err)?;
+
+                        tmp_fifo.write_all(command.as_str().as_bytes()).map_err(to_simple_err)?;
+                    }
+
+                    let exit_code: std::process::ExitStatus = bash_process.wait().map_err(to_simple_err)?;
+                    if !exit_code.success() && !entry.allow_failure {
+                        return Err(SimpleError::new(&format!("{:?} returned status code {:?} or was killed by signal {:?}", command, exit_code.code(), exit_code.signal())));
+                    }
+                } else {
+                    println!("dry: run command: {}", command);
+                }
+            } else if entry.type_ == "file" {
+                // 2.3.2 Extract files
+                for file in entry.files.as_ref().ok_or(SimpleError::new("no file list in entry while its type is file"))? {
+                    println!("unpacking: {}", file.name);
+                    // 2.3.2.1 Get path
+                    let archive_file_path = Path::new(&self.resolve_var(
+                        &format!("{}/{}:archiveDir", entry.id, file.name),
+                        &file.archive_dir,
+                        Some(entry),
+                        &config,
+                        1,
+                    )?.to_string()).to_owned();
+                    let system_file_path = Path::new(&self.resolve_var(
+                        &format!("{}/{}:systemDir", entry.id, file.name),
+                        &file.system_dir,
+                        Some(entry),
+                        &config,
+                        1,
+                    )?.to_string()).to_owned();
+
+                    enum DecidedOperation {
+                        None,
+                        Overwrite,
+                        
+                    }
+
+                    // 2.3.2.2 Check if exists
+                    let mut decided_operation = DecidedOperation::None;
+                    let system_file_path_exists = system_file_path.exists();
+                    let system_file_path_no_perm = if let Err(err) = system_file_path.metadata() {
+                        err.kind() == std::io::ErrorKind::PermissionDenied
+                    } else { false };
+
+                    if system_file_path_no_perm {
+                        if self.ask(
+                            "system_file_path_no_perm",
+                            &format!("you have no access to {}. Continue?", system_file_path.to_string_lossy()),
+                            &vec!["yes", "no", "all", "nottoall", "exit"],
+                        ) == "no" {
+                            continue;
+                        }
+                        decided_operation = DecidedOperation::Overwrite;
+                    }
+                    
+                    if matches!(decided_operation, DecidedOperation::None) {
+                        if file.expect_when_unpack == "notExist" {
+                            if system_file_path_exists {
+                                if self.ask(
+                                    "system_file_path_exists_whether_overwrite",
+                                    &format!("{} already exists, which is unexpected. Overwrite?", system_file_path.to_string_lossy()),
+                                    &vec!["yes", "no", "all", "nottoall", "exit"],
+                                ) == "no" {
+                                    continue;
+                                }
+                                decided_operation = DecidedOperation::Overwrite;
+                            }
+                        } else if file.expect_when_unpack == "exist" {
+                            if !system_file_path_exists {
+                                if self.ask(
+                                    "system_file_path_not_exists",
+                                    &format!("{} does not exist, which is unexpected. Continue?", system_file_path.to_string_lossy()),
+                                    &vec!["yes", "no", "all", "nottoall", "exit"],
+                                ) == "no" {
+                                    continue;
+                                }
+                                decided_operation = DecidedOperation::Overwrite;
+                            }
+                        }
+                    }
+
+                    // 2.3.2.3 Prepare for compare(if needed)
+                    let mut archive_new_file_live_tar = archive.tar()?;
+                    let mut archive_new_file = archive_new_file_live_tar.to_entry_with_path(&archive_file_path)?;
+                    let (mut archive_new_tmp_file, archive_new_tmp_file_path) = tempfile::NamedTempFile::new().map_err(to_simple_err).and_then(|ntf| ntf.keep().map_err(to_simple_err))?;
+                    std::io::copy(&mut archive_new_file, &mut archive_new_tmp_file);
+                    let overwrite_src_file_path = archive_new_tmp_file_path.to_owned();
+
+                    let owner = file.owner.as_ref();
+                    let mode = file.mode.as_ref();
+                    let mode = match mode {
+                        Some(EntryFileMode::Octal(ref o)) => {
+                            if *o < 0o000 || *o > 0o777 {
+                                return Err(SimpleError::new(
+                                    &format!("invalid mode value: {:o}", o)
+                                ));
+                            } else { Some(*o) }
+                        },
+                        Some(EntryFileMode::String(s)) => {
+                            Some(u64::from_str_radix(s.trim_start_matches("0o"), 8)
+                                .map_err(to_simple_err)?)
+                        },
+                        None => None,
+                    };
+
+                    let system_file = File::open(system_file_path).ok();
+                    if matches!(decided_operation, DecidedOperation::None)
+                            && existing_config.is_some()
+                            && matches!(existing_config.as_ref().unwrap().entries_mapping.get(&entry.id).and_then(|e| Some(e.borrow().archive_path_set.borrow().contains(&archive_file_path.to_str()?.to_owned()))), Some(true))
+                            && system_file.is_some() {
+                        // 2.3.2.4 Compare: in-file-system, archive-old, archive-new
+                        let mut system_file = system_file.unwrap();
+                        let mut archive_old_file_live_tar = existing_archive.as_mut().unwrap().tar()?;
+                        let mut archive_old_file = archive_old_file_live_tar.to_entry_with_path(&archive_file_path)?;
+                        let (mut archive_old_tmp_file, mut archive_old_tmp_file_path) = tempfile::NamedTempFile::new().map_err(to_simple_err).and_then(|ntf| ntf.keep().map_err(to_simple_err))?;
+                        let (mut system_tmp_file, mut system_tmp_file_path) = tempfile::NamedTempFile::new().map_err(to_simple_err).and_then(|ntf| ntf.keep().map_err(to_simple_err))?;
+
+                        {
+                            let mut archive_old_file = archive_old_file;
+                            std::io::copy(&mut archive_old_file, &mut archive_old_tmp_file);
+                            std::io::copy(&mut system_file, &mut system_tmp_file);
+                        }
+                    }
+                }
+            } else {
+                unreachable!();
+            }
+        }
+
         Ok(())
     }
 }
@@ -501,31 +777,25 @@ fn main() {
     //MyInitExecution::new().print(&vec![&(String::from("Hello world!"))]);
     env_logger::init();
     let mut yaml: serde_yaml::Value = serde_yaml::from_reader(File::open("config.yaml").unwrap()).unwrap();
-    let mut config: MyInitConfig = serde_yaml::from_value(yaml).unwrap();
+
     let mut mie = MyInitExecution::new();
 
-    mie.process_config(&mut config);
+    // let (mut config, mut archive) =
+    //     mie.load_archive("./riv_conf.5.tar.gz").unwrap();
 
-    {
-        let file = File::open("./riv_conf.5.tar.gz").unwrap();
-        let a = archive::MyInitArchive::new(file);
+    // mie.process_config(&mut config);
 
-        let mut x = a.tar();
-        
-        {
-            let mut y: tar::Archive<_> = x.get();
-            for e in y.entries().unwrap() {
-                println!("{:?}", e.unwrap().path().unwrap());
-            }
-        }
+    // let mut y = archive.tar().unwrap();
+    // println!("{:#?}", y.to_entry_path_list());
 
-        {
-            let mut y: tar::Archive<flate2::read::GzDecoder<&mut std::fs::File>> = &mut x;
-            for e in y.entries().unwrap() {
-                println!("{:?}", e.unwrap().path().unwrap());
-            }
-        }
-    };
+    // println!("==========");
+
+    // let mut y = archive.tar().unwrap();
+    // println!("{:#?}", y.to_entry_path_list());
+
+    // let mut y = archive.tar().unwrap();
+    // let mut data = Vec::new();
+    // println!("{:#?}", y.to_entry_with_path("config.yaml").unwrap().read_to_end(&mut data).unwrap());
     
     // mie.load_archive("./riv_conf.5.tar.gz");
 

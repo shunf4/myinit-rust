@@ -28,3 +28,5 @@ simple-error = "^0.2.2"
 enum-as-inner = "^0.3.3"
 dynfmt = { version = "^0.1.4", features = [] }
 flate2 = "^1.0"
+tempfile = "^3"
+nix = "^0.18.0"

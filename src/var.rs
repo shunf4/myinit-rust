@@ -1,4 +1,3 @@
-
 use std::cell::RefCell;
 use regex::Regex;
 use enum_as_inner::EnumAsInner;
@@ -33,6 +32,16 @@ impl std::fmt::Display for VarValue {
     }
 }
 
+impl From<VarValue> for bool {
+    fn from(var_value: VarValue) -> Self {
+        match var_value {
+            VarValue::String(s) => s != "0" && s != "" && s.to_lowercase() != "false",
+            VarValue::Bool(b) => b,
+            VarValue::Int(i) => i != 0,
+            VarValue::Real(r) => r != 0.0_f64,
+        }
+    }
+}
 
 pub enum EntrySelector {
     None,
@@ -127,6 +136,9 @@ pub struct Entry {
     #[serde(rename = "shouldAskForConfirm", default = "Entry::should_ask_for_confirm_default")]
     pub should_ask_for_confirm: bool,
 
+    #[serde(rename = "allowFailure", default = "Entry::allow_failure_default")]
+    pub allow_failure: bool,
+
     pub command: Option<Var>,
 
     #[validate(custom = "validate_files")]
@@ -145,4 +157,11 @@ pub struct Entry {
 
 impl Entry {
     fn should_ask_for_confirm_default() -> bool { false }
+    fn allow_failure_default() -> bool { false }
+    pub fn name_for_human(&self) -> String {
+        match &self.name {
+            Some(some_name) => format!("{} ({})", self.id, some_name),
+            None => self.id.to_owned()
+        }
+    }
 }

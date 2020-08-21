@@ -3,7 +3,8 @@ use regex::Regex;
 use enum_as_inner::EnumAsInner;
 use validator::{Validate, ValidationError, ValidationErrors};
 use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Deserializer};
+use serde::de::Error;
 use validator_derive::{Validate};
 use lazy_static::lazy_static;
 
@@ -32,13 +33,13 @@ impl std::fmt::Display for VarValue {
     }
 }
 
-impl From<VarValue> for bool {
-    fn from(var_value: VarValue) -> Self {
+impl From<&VarValue> for bool {
+    fn from(var_value: &VarValue) -> Self {
         match var_value {
             VarValue::String(s) => s != "0" && s != "" && s.to_lowercase() != "false",
-            VarValue::Bool(b) => b,
-            VarValue::Int(i) => i != 0,
-            VarValue::Real(r) => r != 0.0_f64,
+            VarValue::Bool(b) => *b,
+            VarValue::Int(i) => *i != 0,
+            VarValue::Real(r) => *r != 0.0_f64,
         }
     }
 }
@@ -83,10 +84,31 @@ pub enum Var {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
 pub enum EntryFileMode {
-    Octal(u64),
+    Octal(u32),
     String(String),
 }
 
+fn deserialize_mode<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>
+{
+    let entry_file_mode: Option<EntryFileMode> = Deserialize::deserialize(deserializer)?;
+    match entry_file_mode {
+        Some(EntryFileMode::Octal(mode)) => {
+            if mode < 0o000 || mode > 0o777 {
+                Err(D::Error::custom(
+                    format!("mode {} should be between 0o000 and 0o777", mode)
+                ))
+            } else { Ok(Some(mode)) }
+        },
+        Some(EntryFileMode::String(s)) => {
+            Ok(Some(u32::from_str_radix(&s, 8).map_err(|err| {
+                D::Error::custom(err)
+            })?))
+        },
+        None => Ok(None),
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Validate)]
 pub struct EntryFile {
@@ -102,7 +124,8 @@ pub struct EntryFile {
     #[validate(length(min = 1))]
     pub owner: Option<String>,
 
-    pub mode: Option<EntryFileMode>,
+    #[serde(deserialize_with = "deserialize_mode")]
+    pub mode: Option<u32>,
 
     #[validate(regex = "RE_ENTRY_EXPECT_WHEN_UNPACK")]
     #[serde(rename = "expectWhenUnpack", default = "EntryFile::expect_when_unpack_default")]
@@ -118,7 +141,7 @@ fn validate_files(files: &Vec<EntryFile>) -> Result<(), ValidationError> {
         .map(|ef| ef.validate())
         .collect::<Result<Vec<_>, _>>()
         .map(|_| ())
-        .map_err(|err| ValidationError::new("One EntryFile is invalid"))
+        .map_err(|_err| ValidationError::new("One EntryFile is invalid"))
 }
 
 #[derive(Serialize, Deserialize, Debug, Validate)]

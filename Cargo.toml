@@ -30,3 +30,6 @@ dynfmt = { version = "^0.1.4", features = [] }
 flate2 = "^1.0"
 tempfile = "^3"
 nix = "^0.18.0"
+unicode_reader = "^1.0.1"
+file_diff = "^1.0.0"
+path-absolutize = "^1.0.2"

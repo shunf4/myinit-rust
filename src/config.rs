@@ -1,7 +1,5 @@
 use std::cell::RefCell;
-use regex::Regex;
-use enum_as_inner::EnumAsInner;
-use validator::{Validate, ValidationError, ValidationErrors};
+use validator::{Validate};
 use std::collections::HashMap;
 use std::rc::Rc;
 use serde::{Deserialize, Serialize};
@@ -9,8 +7,7 @@ use validator_derive::{Validate};
 use simple_error::SimpleError;
 
 use crate::util::to_simple_err;
-use crate::archive::MyInitArchive;
-use crate::var::{Entry, Var, VarStruct, VarValue};
+use crate::var::{Entry, Var};
 
 #[derive(Serialize, Deserialize, Debug, Validate)]
 pub struct MyInitConfig {

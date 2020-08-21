@@ -1,5 +1,3 @@
-use std::cell::{RefMut, RefCell};
-use std::rc::Rc;
 use std::io::prelude::*;
 use tar::{Archive, Builder};
 use std::fs::File;

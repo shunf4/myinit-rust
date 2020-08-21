@@ -219,6 +219,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "file_diff"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31a7a908b8f32538a2143e59a6e4e2508988832d5d4d6f7c156b3cbc762643a5"
+
+[[package]]
 name = "filetime"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -457,12 +463,14 @@ dependencies = [
  "dynfmt",
  "enum-as-inner",
  "env_logger",
+ "file_diff",
  "flate2",
  "getopts",
  "indicatif",
  "lazy_static",
  "log",
  "nix",
+ "path-absolutize",
  "regex",
  "serde",
  "serde_json",
@@ -470,6 +478,7 @@ dependencies = [
  "simple-error",
  "tar",
  "tempfile",
+ "unicode_reader",
  "users",
  "validator",
  "validator_derive",
@@ -527,6 +536,25 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "winapi 0.3.9",
+]
+
+[[package]]
+name = "path-absolutize"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ceeedc827d9a758b4641457683ced2f02d4252cc1bd8794c415ed20256114290"
+dependencies = [
+ "path-dedot",
+ "slash-formatter",
+]
+
+[[package]]
+name = "path-dedot"
+version = "1.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45c58ab1edb03f77d0bb3f08e4a179dd43ce9bc8eab9867ec53a78285ea3039b"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]
@@ -770,6 +798,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c111b5bd5695e56cffe5129854aa230b39c93a305372fdbb2668ca2394eea9f8"
 
 [[package]]
+name = "slash-formatter"
+version = "2.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f7fb98e76e2022054673f3ebc43a4e12890ec6272530629df6237cafbb70569"
+
+[[package]]
 name = "smallvec"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -919,6 +953,16 @@ name = "unicode-xid"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7fe0bb3479651439c9112f72b6c505038574c9fbb575ed1bf3b797fa39dd564"
+
+[[package]]
+name = "unicode_reader"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b639121690b27acd92c97ed2b52c5e5e8d3d39482e943b4559695cef62f771a"
+dependencies = [
+ "smallvec",
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "url"

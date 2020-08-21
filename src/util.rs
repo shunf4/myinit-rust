@@ -6,3 +6,11 @@ where
 {
     SimpleError::new(&format!("{}", sth))
 }
+
+pub fn extend_perm_exc(perm: u32) -> u32 {
+    if perm > 0o777 { unreachable!(); }
+    perm
+        | if (perm & 0o600) != 0 { 0o100 } else { 0 }
+        | if (perm & 0o060) != 0 { 0o010 } else { 0 }
+        | if (perm & 0o006) != 0 { 0o001 } else { 0 }
+}

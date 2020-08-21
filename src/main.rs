@@ -1,40 +1,32 @@
 use std::io::prelude::*;
 use std::fs::File;
-use std::rc::Rc;
 use std::fmt::Debug;
 use std::convert::TryInto;
 use std::path::{Path, PathBuf};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::string::String;
-use yaml_rust::{YamlLoader, YamlEmitter};
-use std::borrow::Cow;
-use console::Style;
 use dialoguer::{theme::{SimpleTheme, ColorfulTheme, Theme}, Input};
-use serde::{Deserialize, Serialize};
-use validator::{Validate, ValidationError, ValidationErrors};
-use regex::Regex;
 use simple_error::SimpleError;
 use log::{info, debug};
-use log::Level;
-use enum_as_inner::EnumAsInner;
 use dynfmt::Format;
-use flate2::read::GzDecoder;
-use var::{Entry, EntrySelector, Var, VarValue, VarStruct, EntryFileMode};
+use var::{Entry, EntrySelector, Var, VarValue, VarStruct};
 use config::MyInitConfig;
 use archive::MyInitArchive;
 use util::to_simple_err;
 use nix::unistd;
 use std::process;
 use std::os::unix::process::ExitStatusExt;
+use std::os::unix::fs::PermissionsExt;
+use unicode_reader::CodePoints;
+use file_diff::diff_files;
+use path_absolutize::*;
 
 mod curly_modified;
 mod var;
 mod config;
 mod archive;
 mod util;
-
-enum AskEnum<'a> { Box(Box<String>), Ref(&'a String) }
 
 struct MyInitExecution {
     consts: HashMap<String, Var>,
@@ -219,7 +211,6 @@ impl MyInitExecution {
 
         let string_to_format: String = value.as_string().unwrap().clone();
         let mut string_to_work_on: String = string_to_format.clone();
-        let char_indices = string_to_format.char_indices().collect::<Vec<(usize, char)>>();
 
         let mut replacements: Vec<(usize, usize, String)> = Vec::new();
 
@@ -401,7 +392,7 @@ impl MyInitExecution {
     }
 
     fn is_dry_run(&self, entry: Option<&Entry>, config: &MyInitConfig) -> Result<bool, SimpleError> {
-        Ok(bool::from(self.resolve_var("DryRun",
+        Ok(bool::from(&self.resolve_var("DryRun",
             &Var::VarStruct(VarStruct {
                 ref_var: Some("DryRun".to_owned()),
                 do_not_format: true,
@@ -437,17 +428,6 @@ impl MyInitExecution {
                 }
             }
         }
-    }
-
-    fn read_config(&self, archive_path: &str) -> Result<(MyInitConfig, MyInitArchive), SimpleError> {
-        let mut archive = MyInitArchive::new(
-            File::open(archive_path).map_err(to_simple_err)?
-        );
-
-        Ok((
-            MyInitConfig::try_from(archive.tar()?.to_entry_with_path(Path::new("config.yaml"))?)?,
-            archive,
-        ))
     }
 
     fn load_archive(&self, archive_path: &str) -> Result<(MyInitConfig, MyInitArchive), SimpleError> {
@@ -496,7 +476,7 @@ impl MyInitExecution {
             None => EntrySelector::None
         };
 
-        let (mut config, mut archive) =
+        let (config, mut archive) =
         self.load_archive("./riv_conf.5.tar.gz")?;
 
         // 0. Check current user
@@ -626,7 +606,7 @@ impl MyInitExecution {
                 if !self.is_dry_run(Some(entry), &config)? {
                     let tmp_dir = tempfile::tempdir().unwrap();
                     let tmp_fifo_path = tmp_dir.path().to_owned().join("fifo");
-                    nix::unistd::mkfifo(
+                    unistd::mkfifo(
                         &tmp_fifo_path,
                         nix::sys::stat::Mode::S_IRWXU | nix::sys::stat::Mode::S_IRWXG | nix::sys::stat::Mode::S_IRWXO
                     ).map_err(to_simple_err)?;
@@ -674,7 +654,7 @@ impl MyInitExecution {
                     enum DecidedOperation {
                         None,
                         Overwrite,
-                        
+                        Skip,
                     }
 
                     // 2.3.2.2 Check if exists
@@ -725,42 +705,247 @@ impl MyInitExecution {
                     let mut archive_new_file_live_tar = archive.tar()?;
                     let mut archive_new_file = archive_new_file_live_tar.to_entry_with_path(&archive_file_path)?;
                     let (mut archive_new_tmp_file, archive_new_tmp_file_path) = tempfile::NamedTempFile::new().map_err(to_simple_err).and_then(|ntf| ntf.keep().map_err(to_simple_err))?;
-                    std::io::copy(&mut archive_new_file, &mut archive_new_tmp_file);
-                    let overwrite_src_file_path = archive_new_tmp_file_path.to_owned();
+                    std::io::copy(&mut archive_new_file, &mut archive_new_tmp_file).map_err(to_simple_err)?;
+                    let mut overwrite_src_file_path = archive_new_tmp_file_path.to_owned();
+                    let mut system_tmp_file_path: Option<PathBuf> = None;
 
                     let owner = file.owner.as_ref();
                     let mode = file.mode.as_ref();
-                    let mode = match mode {
-                        Some(EntryFileMode::Octal(ref o)) => {
-                            if *o < 0o000 || *o > 0o777 {
-                                return Err(SimpleError::new(
-                                    &format!("invalid mode value: {:o}", o)
-                                ));
-                            } else { Some(*o) }
-                        },
-                        Some(EntryFileMode::String(s)) => {
-                            Some(u64::from_str_radix(s.trim_start_matches("0o"), 8)
-                                .map_err(to_simple_err)?)
-                        },
-                        None => None,
-                    };
 
-                    let system_file = File::open(system_file_path).ok();
+                    let system_file = File::open(&system_file_path).ok();
                     if matches!(decided_operation, DecidedOperation::None)
                             && existing_config.is_some()
                             && matches!(existing_config.as_ref().unwrap().entries_mapping.get(&entry.id).and_then(|e| Some(e.borrow().archive_path_set.borrow().contains(&archive_file_path.to_str()?.to_owned()))), Some(true))
                             && system_file.is_some() {
                         // 2.3.2.4 Compare: in-file-system, archive-old, archive-new
-                        let mut system_file = system_file.unwrap();
+                        let ref mut system_file = system_file.as_ref().unwrap();
                         let mut archive_old_file_live_tar = existing_archive.as_mut().unwrap().tar()?;
-                        let mut archive_old_file = archive_old_file_live_tar.to_entry_with_path(&archive_file_path)?;
-                        let (mut archive_old_tmp_file, mut archive_old_tmp_file_path) = tempfile::NamedTempFile::new().map_err(to_simple_err).and_then(|ntf| ntf.keep().map_err(to_simple_err))?;
-                        let (mut system_tmp_file, mut system_tmp_file_path) = tempfile::NamedTempFile::new().map_err(to_simple_err).and_then(|ntf| ntf.keep().map_err(to_simple_err))?;
+                        let archive_old_file = archive_old_file_live_tar.to_entry_with_path(&archive_file_path)?;
+                        let (mut archive_old_tmp_file, archive_old_tmp_file_path) = tempfile::NamedTempFile::new().map_err(to_simple_err).and_then(|ntf| ntf.keep().map_err(to_simple_err))?;
+                        let (mut system_tmp_file, system_tmp_file_path_) = tempfile::NamedTempFile::new().map_err(to_simple_err).and_then(|ntf| ntf.keep().map_err(to_simple_err))?;
+
+                        system_tmp_file_path = Some(system_tmp_file_path_);
 
                         {
                             let mut archive_old_file = archive_old_file;
-                            std::io::copy(&mut archive_old_file, &mut archive_old_tmp_file);
-                            std::io::copy(&mut system_file, &mut system_tmp_file);
+                            std::io::copy(&mut archive_old_file, &mut archive_old_tmp_file).map_err(to_simple_err)?;
+                            std::io::copy(system_file, &mut system_tmp_file).map_err(to_simple_err)?;
+                        }
+
+                        archive_old_tmp_file.seek(std::io::SeekFrom::Start(0)).map_err(to_simple_err)?;
+                        archive_new_tmp_file.seek(std::io::SeekFrom::Start(0)).map_err(to_simple_err)?;
+                        system_tmp_file.seek(std::io::SeekFrom::Start(0)).map_err(to_simple_err)?;
+
+                        let archive_old_eq_system = diff_files(&mut archive_old_tmp_file, &mut system_tmp_file);
+
+                        let mut archive_new_tmp_file_cp = CodePoints::from(&mut archive_new_tmp_file);
+                        let _archive_new_is_text = loop {
+                            let x = archive_new_tmp_file_cp.next();
+                            if x.is_none() { break true; }
+                            let x = x.unwrap();
+                            if let Err(err) = x {
+                                if err.kind() == std::io::ErrorKind::InvalidData { break false; }
+                            }
+                        };
+
+                        archive_old_tmp_file.seek(std::io::SeekFrom::Start(0)).map_err(to_simple_err)?;
+                        archive_new_tmp_file.seek(std::io::SeekFrom::Start(0)).map_err(to_simple_err)?;
+                        system_tmp_file.seek(std::io::SeekFrom::Start(0)).map_err(to_simple_err)?;
+
+                        if !archive_old_eq_system {
+                            let mut archive_old_tmp_file_cp = CodePoints::from(&mut archive_old_tmp_file);
+                            let mut system_tmp_file_cp = CodePoints::from(&mut system_tmp_file);
+
+                            enum CompareFileResult {
+                                TextEq,
+                                TextNotEq,
+                                Bin,
+                            }
+
+                            let archive_old_system_comp_result = loop {
+                                let x = archive_old_tmp_file_cp.next();
+                                let y = system_tmp_file_cp.next();
+                                if x.is_none() && y.is_none() { break CompareFileResult::TextEq; }
+                                if x.is_none() || y.is_none() { break CompareFileResult::TextNotEq; }
+                                let (x, y) = (x.unwrap(), y.unwrap());
+                                if let Err(err) = x.as_ref() {
+                                    if err.kind() == std::io::ErrorKind::InvalidData { break CompareFileResult::Bin; }
+                                }
+                                if let Err(err) = y.as_ref() {
+                                    if err.kind() == std::io::ErrorKind::InvalidData { break CompareFileResult::Bin; }
+                                }
+                                let (x, y) = (x.unwrap(), y.unwrap());
+                                if x != y { break CompareFileResult::TextNotEq; }
+                            };
+
+                            // 2.3.2.5 Resolve conflict in cases
+                            match archive_old_system_comp_result {
+                                CompareFileResult::TextEq => { decided_operation = DecidedOperation::Overwrite; },
+                                CompareFileResult::TextNotEq => {
+                                    let ask_result = self.ask(
+                                        "conflict",
+                                        &format!("{} is modified since the unpack of last version. Overwrite, skip or resolve conflict?", system_file_path.to_string_lossy()),
+                                        &vec![
+                                            "resolve",
+                                            "skip",
+                                            "overwrite",
+                                            "alwaysresolve",
+                                            "alwaysskip",
+                                            "alwaysoverwrite",
+                                            "exit",
+                                        ]
+                                    );
+                                    
+                                    if ask_result == "overwrite" {
+                                        decided_operation = DecidedOperation::Overwrite;
+                                    } else if ask_result == "skip" {
+                                        decided_operation = DecidedOperation::Skip;
+                                    } else if ask_result == "resolve" {
+                                        let mut git_merge_cmd = process::Command::new("git");
+                                        git_merge_cmd
+                                            .arg("merge-file")
+                                            .arg("-L")
+                                            .arg({
+                                                let mut s = system_file_path.as_os_str().to_owned();
+                                                s.push(" (system)");
+                                                s
+                                            })
+                                            .arg("-L")
+                                            .arg({
+                                                let mut s = system_file_path.as_os_str().to_owned();
+                                                s.push(" (null)");
+                                                s
+                                            })
+                                            .arg("-L")
+                                            .arg({
+                                                let mut s = system_file_path.as_os_str().to_owned();
+                                                s.push(" (new)");
+                                                s
+                                            })
+                                            .arg(system_tmp_file_path.as_ref().unwrap().as_os_str())
+                                            .arg("/dev/null")
+                                            .arg(archive_new_tmp_file_path.as_os_str());
+                                        println!("executing {:?}", git_merge_cmd);
+                                        let proc_exit_status = git_merge_cmd.status().map_err(to_simple_err)?;
+
+                                        if !proc_exit_status.success() {
+                                            return Err(SimpleError::new("git merge-file command did not end sucessfully"));
+                                        }
+
+                                        let mut vim_cmd = process::Command::new(
+                                            std::env::var_os("EDITOR").unwrap_or("vim".into())
+                                        );
+                                        vim_cmd.arg(&system_tmp_file_path.as_ref().unwrap());
+                                        println!("executing {:?}", vim_cmd);
+
+                                        let proc_exit_status = vim_cmd.status().map_err(to_simple_err)?;
+
+                                        if !proc_exit_status.success() {
+                                            return Err(SimpleError::new("editor command did not end sucessfully"));
+                                        }
+
+                                        overwrite_src_file_path = system_tmp_file_path.as_ref().unwrap().to_owned();
+                                        decided_operation = DecidedOperation::Overwrite;
+                                    } else { unreachable!(); }
+                                },
+                                CompareFileResult::Bin => {
+                                    let ask_result = self.ask(
+                                        "conflict_bin",
+                                        &format!("{} is modified since the unpack of last version. Overwrite or skip?", system_file_path.to_string_lossy()),
+                                        &vec![
+                                            "skip",
+                                            "overwrite",
+                                            "alwaysskip",
+                                            "alwaysoverwrite",
+                                            "exit",
+                                        ]
+                                    );
+                                    
+                                    if ask_result == "overwrite" {
+                                        decided_operation = DecidedOperation::Overwrite;
+                                    } else if ask_result == "skip" {
+                                        decided_operation = DecidedOperation::Skip;
+                                    } else { unreachable!(); }
+                                }
+                            }
+                        } else { decided_operation = DecidedOperation::Overwrite; }
+
+                        drop(archive_old_tmp_file);
+                        drop(system_tmp_file);
+
+                        if let Err(err) = std::fs::remove_file(&archive_old_tmp_file_path) {
+                            println!("removing {}: {:?}", archive_old_tmp_file_path.to_string_lossy(), err);
+                        }
+                    } else { decided_operation = DecidedOperation::Overwrite; }
+
+                    drop(system_file);
+                    drop(archive_new_file);
+                    drop(archive_new_tmp_file);
+
+                    // 2.3.2.6 Take action: overwrite or skip
+                    if matches!(decided_operation, DecidedOperation::Overwrite) {
+                        let system_dir_path = system_file_path.absolutize().map_err(to_simple_err)?.to_owned().parent().unwrap().to_owned();
+                        if !system_dir_path.is_dir() {
+                            if !self.is_dry_run(Some(entry), &config)? {
+                                std::fs::create_dir_all(&system_dir_path).map_err(to_simple_err)?;
+                                if let Some(mode) = file.mode {
+                                    std::fs::set_permissions(&system_dir_path,
+                                        std::fs::Permissions::from_mode(util::extend_perm_exc(mode))
+                                    ).map_err(to_simple_err)?;
+                                }
+                            } else {
+                                println!("dry: created dir {}", system_dir_path.to_string_lossy());
+                            }
+
+                            if !self.is_dry_run(Some(entry), &config)? {
+                                // Actually copying instead of moving
+                                std::fs::copy(overwrite_src_file_path, &system_file_path).map_err(to_simple_err)?;
+                            } else {
+                                println!("dry: moved {} to {}", overwrite_src_file_path.to_string_lossy(), system_file_path.to_string_lossy());
+                            }
+
+                            if let Some(some_mode) = mode {
+                                if !self.is_dry_run(Some(entry), &config)? {
+                                    let proc_exit_status = process::Command::new("chmod")
+                                        .arg(&format!("{:0>4o}", some_mode))
+                                        .arg(&system_file_path)
+                                        .status().map_err(to_simple_err)?;
+        
+                                    if !proc_exit_status.success() {
+                                        return Err(SimpleError::new("chmod command did not end sucessfully"));
+                                    }
+                                } else {
+                                    println!("dry: chmoded {} to {:0>4o}", system_file_path.to_string_lossy(), some_mode);
+                                }
+                            }
+
+                            if let Some(some_owner) = owner {
+                                if !self.is_dry_run(Some(entry), &config)? {
+                                    let proc_exit_status = process::Command::new("chown")
+                                        .arg(some_owner)
+                                        .arg(&system_file_path)
+                                        .status().map_err(to_simple_err)?;
+        
+                                    if !proc_exit_status.success() {
+                                        return Err(SimpleError::new("chown command did not end sucessfully"));
+                                    }
+                                } else {
+                                    println!("dry: chowned {} to {}", system_file_path.to_string_lossy(), some_owner);
+                                }
+                            }
+                        }
+                    } else if matches!(decided_operation, DecidedOperation::Skip) {
+                    } else {
+                        unreachable!();
+                    }
+
+                    if let Err(err) = std::fs::remove_file(&archive_new_tmp_file_path) {
+                        println!("removing {}: {:?}", archive_new_tmp_file_path.to_string_lossy(), err);
+                    }
+
+                    if let Some(some_system_tmp_file_path) = system_tmp_file_path.as_ref() {
+                        if let Err(err) = std::fs::remove_file(some_system_tmp_file_path) {
+                            println!("removing {}: {:?}", some_system_tmp_file_path.to_string_lossy(), err);
                         }
                     }
                 }
@@ -769,6 +954,136 @@ impl MyInitExecution {
             }
         }
 
+        // 3. Close existing tar
+        drop(existing_config);
+        drop(existing_archive);
+
+        debug!("extracting tar to {}...", workspace_dir_path.to_string_lossy());
+        if !self.is_dry_run(None, &config)? {
+            let mut tar = archive.tar()?;
+            for entry in tar.inner_mut().entries().map_err(to_simple_err)? {
+                let mut entry = entry.map_err(to_simple_err)?;
+                if {
+                    let path = entry.path().map_err(to_simple_err)?.to_owned();
+                    path == Path::new("config.yaml")
+                    || path.starts_with(self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string())
+                } {
+                    if entry.unpack_in(workspace_dir_path).map_err(to_simple_err)? == false {
+                        return Err(SimpleError::new(&format!("unsafe archive")));
+                    }
+                }
+            }
+        } else {
+            println!("dry: extracted {} and config.yaml to workspace: {}", self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string(), workspace_dir_path.to_string_lossy());
+        }
+
+        if workspace_dir_path.absolutize().map_err(to_simple_err)? == Path::new(archive_path).absolutize().map_err(to_simple_err)? {
+            println!("skipping tar copying");
+        } else {
+            let archvie_dest_path = workspace_dir_path.join(config.make_archive_filename()).to_owned();
+            if !self.is_dry_run(None, &config)? {
+                std::fs::copy(archive_path, &archvie_dest_path).map_err(to_simple_err)?;
+            } else {
+                println!("dry: copied {} to {}", self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string(), archvie_dest_path.to_string_lossy());
+            }
+        }
+
+        println!("\n=======\nfinished\n=======");
+
+        Ok(())
+    }
+
+    fn pack(&self, archive_path: &str) -> Result<(), SimpleError> {
+        let config = MyInitConfig::try_from(File::open("./config.yaml").map_err(to_simple_err)?)?;
+
+        if let Some(v) = self.overrides.get("DryRun") {
+            if bool::from(v.as_imm_value().unwrap()) {
+                return Err(SimpleError::new(&format!("--dry option is invalid when packing")));
+            }
+        }
+
+        self.check_current_user(&config);
+
+        let mut archive_builder = tar::Builder::new(
+            flate2::write::GzEncoder::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(
+                        Path::new("./").join(config.make_archive_filename())
+                    )
+                    .map_err(to_simple_err)?,
+                flate2::Compression::default()
+            )
+        );
+
+        for entry in config.entries.iter() {
+            let ref mut entry = *entry.borrow_mut();
+            if entry.type_ != "file" { continue; }
+
+            for file in entry.files.as_ref().ok_or(SimpleError::new("no file list in entry while its entry is file"))? {
+                let archive_file_path = Path::new(&self.resolve_var(
+                    &format!("{}/{}:archiveDir", entry.id, file.name),
+                    &file.archive_dir,
+                    Some(entry),
+                    &config,
+                    1,
+                )?.to_string()).to_owned();
+                let system_file_path = Path::new(&self.resolve_var(
+                    &format!("{}/{}:systemDir", entry.id, file.name),
+                    &file.system_dir,
+                    Some(entry),
+                    &config,
+                    1,
+                )?.to_string()).to_owned();
+
+                if archive_file_path.starts_with(
+                    self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string()
+                ) {
+                    continue;
+                }
+
+                let system_file = File::open(&system_file_path).map_err(to_simple_err)?;
+                let system_file_metadata = system_file_path.metadata().map_err(to_simple_err)?;
+                let mut hdr = tar::Header::new_gnu();
+                hdr.set_metadata(&system_file_metadata);
+                hdr.set_path(&archive_file_path);
+
+                if let Some(some_mode) = file.mode {
+                    hdr.set_mode(some_mode);
+                }
+
+                if let Some(some_owner) = &file.owner {
+                    let owner_splitted: Vec<String> = some_owner.split(':').map(|s| s.to_owned()).collect();
+                    if owner_splitted.len() != 2 {
+                        return Err(SimpleError::new(&format!("owner {} invalid", some_owner)));
+                    }
+                    let u = users::get_user_by_name(&owner_splitted[0]).ok_or(SimpleError::new(&format!("user {} invalid", &owner_splitted[0])))?;
+                    let g = users::get_group_by_name(&owner_splitted[1]).ok_or(SimpleError::new(&format!("group {} invalid", &owner_splitted[1])))?;
+                    hdr.set_gid(g.gid() as u64);
+                    hdr.set_uid(u.uid() as u64);
+                    hdr.set_username(u.name().to_str().unwrap()).map_err(to_simple_err)?;
+                    hdr.set_groupname(g.name().to_str().unwrap()).map_err(to_simple_err)?;
+                }
+
+                println!("adding: {} -> {}", system_file_path.to_string_lossy(), archive_file_path.to_string_lossy());
+                archive_builder.append(&hdr, system_file).map_err(to_simple_err)?;
+            }
+        }
+
+        let extra_archive_dir =  PathBuf::from(self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string());
+
+        if extra_archive_dir.is_dir() {
+            archive_builder.append_dir_all(&extra_archive_dir, &extra_archive_dir).map_err(to_simple_err)?;
+        } else {
+            println!("{}", console::style(
+                &format!("WARNING: extra archive dir {} dees not exist. Not packing.", extra_archive_dir.to_string_lossy())
+            ).yellow());
+        }
+
+        println!("adding: ./config.yaml -> config.yaml");
+        archive_builder.append_path_with_name("./config.yaml", "config.yaml").map_err(to_simple_err)?;
+
         Ok(())
     }
 }
@@ -776,9 +1091,8 @@ impl MyInitExecution {
 fn main() {
     //MyInitExecution::new().print(&vec![&(String::from("Hello world!"))]);
     env_logger::init();
-    let mut yaml: serde_yaml::Value = serde_yaml::from_reader(File::open("config.yaml").unwrap()).unwrap();
 
-    let mut mie = MyInitExecution::new();
+    let mie = MyInitExecution::new();
 
     // let (mut config, mut archive) =
     //     mie.load_archive("./riv_conf.5.tar.gz").unwrap();

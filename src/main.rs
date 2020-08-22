@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::string::String;
-use dialoguer::{theme::{SimpleTheme, ColorfulTheme, Theme}, Input};
+use dialoguer::{theme::{ColorfulTheme}, Input};
 use simple_error::SimpleError;
-use log::{info, debug};
+use log::{debug};
 use dynfmt::Format;
 use var::{Entry, EntrySelector, Var, VarValue, VarStruct};
 use config::MyInitConfig;
@@ -403,7 +403,7 @@ impl MyInitExecution {
             1)?))
     }
 
-    fn process_config(&self, config: &mut MyInitConfig) {
+    fn process_config(&self, config: &mut MyInitConfig, archive_path: Option<&str>) {
         config.entries_mapping.clear();
         for entry_rc_refcell in config.entries.iter() {
             let entry_refcell = entry_rc_refcell.as_ref();
@@ -428,6 +428,15 @@ impl MyInitExecution {
                 }
             }
         }
+        if let Some(some_archive_path) = archive_path {
+            config.insert_archive_path(some_archive_path);
+        }
+    }
+
+    fn get_config<R: std::io::Read>(&self, rdr: R, archive_path: Option<&str>) -> Result<MyInitConfig, SimpleError> {
+        let mut config = MyInitConfig::try_from(rdr)?;
+        self.process_config(&mut config, archive_path);
+        Ok(config)
     }
 
     fn load_archive(&self, archive_path: &str) -> Result<(MyInitConfig, MyInitArchive), SimpleError> {
@@ -436,7 +445,7 @@ impl MyInitExecution {
         );
 
         Ok((
-            serde_yaml::from_reader(archive.tar()?.to_entry_with_path(Path::new("config.yaml"))?).map_err(to_simple_err)?,
+            self.get_config(archive.tar()?.to_entry_with_path(Path::new("config.yaml"))?, Some(archive_path))?,
             archive,
         ))
     }
@@ -477,7 +486,7 @@ impl MyInitExecution {
         };
 
         let (config, mut archive) =
-        self.load_archive("./riv_conf.5.tar.gz")?;
+        self.load_archive(archive_path)?;
 
         // 0. Check current user
         self.check_current_user(&config);
@@ -540,8 +549,9 @@ impl MyInitExecution {
         let mut existing_config: Option<MyInitConfig> = None;
         let mut existing_archive: Option<MyInitArchive> = None;
         if !workspace_conf_not_accessable && workspace_conf_exists && workspace_conf_is_file {
-            existing_config = Some(MyInitConfig::try_from(File::open(workspace_conf_path).map_err(to_simple_err)?)?);
+            existing_config = Some(self.get_config(File::open(workspace_conf_path).map_err(to_simple_err)?, None)?);
             let existing_archive_path = workspace_dir_path.join(existing_config.as_ref().unwrap().make_archive_filename());
+            existing_config.as_mut().unwrap().insert_archive_path(existing_archive_path.to_str().ok_or(SimpleError::new(&format!("broken existing_archive_path")))?);
 
             if !existing_archive_path.is_file() {
                 if self.ask(
@@ -993,8 +1003,8 @@ impl MyInitExecution {
         Ok(())
     }
 
-    fn pack(&self, archive_path: &str) -> Result<(), SimpleError> {
-        let config = MyInitConfig::try_from(File::open("./config.yaml").map_err(to_simple_err)?)?;
+    fn pack(&self) -> Result<(), SimpleError> {
+        let config = self.get_config(File::open("./config.yaml").map_err(to_simple_err)?, None)?;
 
         if let Some(v) = self.overrides.get("DryRun") {
             if bool::from(v.as_imm_value().unwrap()) {
@@ -1047,7 +1057,7 @@ impl MyInitExecution {
                 let system_file_metadata = system_file_path.metadata().map_err(to_simple_err)?;
                 let mut hdr = tar::Header::new_gnu();
                 hdr.set_metadata(&system_file_metadata);
-                hdr.set_path(&archive_file_path);
+                hdr.set_path(&archive_file_path).map_err(to_simple_err)?;
 
                 if let Some(some_mode) = file.mode {
                     hdr.set_mode(some_mode);
@@ -1088,56 +1098,94 @@ impl MyInitExecution {
     }
 }
 
+fn print_usage(program: &str, opts: getopts::Options) {
+    let brief = format!("Usage:
+        {0} unpack/u [-d/--dry] [-a/--action-auto-default] [-v/--value-auto-default] <archive>.tar.gz
+        {0} pack/p [-a/--action-auto-default] [-v/--value-auto-default]
+        
+        unpack: read the config(manifest) in <archive>.tar.gz, extract the files to the system and executed the commands
+        pack: you need to be in the workspace directory; read config.yaml in current directory, fetch needed files in current system and make an archive(.tar.gz)",
+        program
+    );
+    print!("{}", opts.usage(&brief));
+}
+
 fn main() {
     //MyInitExecution::new().print(&vec![&(String::from("Hello world!"))]);
     env_logger::init();
+    let args: Vec<String> = std::env::args().collect();
 
-    let mie = MyInitExecution::new();
+    let mut mie = MyInitExecution::new();
 
-    // let (mut config, mut archive) =
-    //     mie.load_archive("./riv_conf.5.tar.gz").unwrap();
+    let mut opts = getopts::Options::new();
+    opts.optflag("d", "dry", "dry run - only outputs what should be done instead of actually doing them");
+    opts.optflag("a", "action-auto-default", "automatically choose the default action when asked(actions are things like yes/no/overwrite etc.)");
+    opts.optflag("v", "value-auto-default", "automatically choose the default value of a variable when asked for");
+    opts.optflag("h", "help", "print this usage");
 
-    // mie.process_config(&mut config);
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => { m },
+        Err(f) => { panic!(f.to_string()) }
+    };
 
-    // let mut y = archive.tar().unwrap();
-    // println!("{:#?}", y.to_entry_path_list());
+    enum Command {
+        Unpack(String, Option<String>),
+        Pack,
+    };
 
-    // println!("==========");
+    if matches.opt_present("h") {
+        print_usage(&args[0], opts);
+        process::exit(2);
+    }
 
-    // let mut y = archive.tar().unwrap();
-    // println!("{:#?}", y.to_entry_path_list());
+    let command = if matches.free.len() == 2 {
+        if matches.free[0] == "unpack" || matches.free[0] == "u" {
+            Command::Unpack(matches.free[1].to_owned(), Some(matches.free[2].to_owned()))
+        } else {
+            print_usage(&args[0], opts);
+            process::exit(2);
+        }
+    } else if matches.free.len() == 2 {
+        if matches.free[0] == "unpack" || matches.free[0] == "u" {
+            Command::Unpack(matches.free[1].to_owned(), None)
+        } else {
+            print_usage(&args[0], opts);
+            process::exit(2);
+        }
+    } else if matches.free.len() == 1 {
+        if matches.free[0] == "pack" || matches.free[0] == "p" {
+            Command::Pack
+        } else {
+            print_usage(&args[0], opts);
+            process::exit(2);
+        }
+    } else {
+        print_usage(&args[0], opts);
+        process::exit(2);
+    };
 
-    // let mut y = archive.tar().unwrap();
-    // let mut data = Vec::new();
-    // println!("{:#?}", y.to_entry_with_path("config.yaml").unwrap().read_to_end(&mut data).unwrap());
-    
-    // mie.load_archive("./riv_conf.5.tar.gz");
+    if matches.opt_present("d") {
+        match command {
+            Command::Pack => {
+                print_usage(&args[0], opts);
+                process::exit(2);
+            },
+            Command::Unpack(_, _) => {
+                mie.overrides.insert("DryRun".into(), Var::ImmValue(VarValue::Bool(true)));
+            }
+        };
+    }
 
-    // println!("{:#?}", &config.entries[1].borrow());
+    if matches.opt_present("a") {
+        mie.overrides.insert("ShouldAutoUseDefaultAskOpt".into(), Var::ImmValue(VarValue::Bool(true)));
+    }
 
-    // println!("{:#?}", mie.resolve_var("&config.entries[1].files.unwrap()[0].archive_dir", &config.entries[1].borrow().files.as_ref().unwrap()[0].archive_dir, Some(&config.entries[1].borrow()), &config, 0));
+    if matches.opt_present("v") {
+        mie.overrides.insert("ShouldAutoUseDefaultValue".into(), Var::ImmValue(VarValue::Bool(true)));
+    }
 
-    // println!("{:#?}", mie.resolve_var("&config.entries[1].files.unwrap()[1].archive_dir", &config.entries[1].borrow().files.as_ref().unwrap()[1].archive_dir, Some(&config.entries[1].borrow()), &config, 0));
-
-    // println!("{:#?}", mie.resolve_var("&config.entries[0].command.as_ref().unwrap()", &config.entries[0].borrow().command.as_ref().unwrap(), Some(&config.entries[0].borrow()), &config, 0));
-
-    // println!("{:#?}", mie.resolve_var("&config.entries[2].command.as_ref().unwrap()", &config.entries[2].borrow().command.as_ref().unwrap(), Some(&config.entries[2].borrow()), &config, 0));
-
-    // println!("{:#?}", mie.resolve_var("&config.entries[15].command.as_ref().unwrap()", &config.entries[15].borrow().command.as_ref().unwrap(), Some(&config.entries[15].borrow()), &config, 0));
-
-    // println!("ask() Return: {}", mie.ask("_", "prompt", &vec![
-    //     "yes",
-    //     "no",
-    //     "alwaysoverwrite",
-    // ]));
-    // println!("ask() Return: {}", mie.ask("_", "prompt", &vec![
-    //     "yes",
-    //     "no",
-    //     "alwaysoverwrite",
-    // ]));
-    // println!("ask() Return: {}", mie.ask("_", "prompt", &vec![
-    //     "yes",
-    //     "no",
-    //     "alwaysoverwrite",
-    // ]));
+    match command {
+        Command::Unpack(archive_path, entry_selector) => { mie.unpack(&archive_path, entry_selector.as_ref().map(|s| s.as_str())).unwrap(); },
+        Command::Pack => { mie.pack().unwrap(); },
+    }
 }

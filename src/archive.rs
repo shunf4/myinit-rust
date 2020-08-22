@@ -1,8 +1,7 @@
 use std::io::prelude::*;
-use tar::{Archive, Builder};
+use tar::{Archive};
 use std::fs::File;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
 use simple_error::SimpleError;
 use std::path::Path;
 
@@ -43,6 +42,7 @@ impl<'a> MyInitLiveArchive<'a> {
         &mut self.inner
     }
 
+    #[allow(dead_code)]
     pub fn to_entry_path_list(&mut self) -> Result<Vec<String>, SimpleError> {
         self
             .inner

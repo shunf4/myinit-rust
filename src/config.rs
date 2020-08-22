@@ -7,7 +7,7 @@ use validator_derive::{Validate};
 use simple_error::SimpleError;
 
 use crate::util::to_simple_err;
-use crate::var::{Entry, Var};
+use crate::var::{Entry, Var, VarValue};
 
 #[derive(Serialize, Deserialize, Debug, Validate)]
 pub struct MyInitConfig {
@@ -40,5 +40,9 @@ impl MyInitConfig {
 
     pub fn make_archive_filename(&self) -> String {
         format!("{}.{}.tar.gz", self.id, self.conf_version)
+    }
+
+    pub fn insert_archive_path(&mut self, archive_path: &str) {
+        self.common_var.insert("Archive".into(), Var::ImmValue(VarValue::String(archive_path.to_owned())));
     }
 }

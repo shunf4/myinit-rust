@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use regex::Regex;
 use enum_as_inner::EnumAsInner;
-use validator::{Validate, ValidationError, ValidationErrors};
+use validator::{Validate, ValidationError};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize, Deserializer};
 use serde::de::Error;
@@ -95,7 +95,7 @@ where
     let entry_file_mode: Option<EntryFileMode> = Deserialize::deserialize(deserializer)?;
     match entry_file_mode {
         Some(EntryFileMode::Octal(mode)) => {
-            if mode < 0o000 || mode > 0o777 {
+            if mode > 0o777 {
                 Err(D::Error::custom(
                     format!("mode {} should be between 0o000 and 0o777", mode)
                 ))

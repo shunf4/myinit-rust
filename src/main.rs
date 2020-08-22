@@ -21,6 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use unicode_reader::CodePoints;
 use file_diff::diff_files;
 use path_absolutize::*;
+use colour::{blue_ln, green_ln, dark_red_ln, red_ln};
 
 mod curly_modified;
 mod var;
@@ -57,8 +58,9 @@ impl MyInitExecution {
             ask_storage: RefCell::new(HashMap::new()),
             theme: Box::new(ColorfulTheme {
                 values_style: console::Style::new(),
-                prompt_style: console::Style::new().yellow().underlined(),
-                success_prefix: console::style("⌛".into()),
+                prompt_style: console::Style::new(),
+                success_prefix: console::style("⌛".into()).yellow(),
+                prompt_prefix: console::style("❓".into()).red(),
                 ..ColorfulTheme::default()
             }),
         };
@@ -83,6 +85,8 @@ impl MyInitExecution {
         mie.consts.insert(String::from("Archive"),
             Var::ImmValue(VarValue::String("/dev/null".into()))
         );
+
+        mie.consts.insert(String::from("DryRun"), Var::ImmValue(VarValue::Bool(false)));
 
         mie.consts.insert(String::from("ShouldAutoUseDefaultValue"), Var::ImmValue(VarValue::Bool(false)));
 
@@ -153,7 +157,7 @@ impl MyInitExecution {
                     ::with_theme(self.theme.as_ref())
                     // .with_initial_text(&one_letter_opts[0])
                     .allow_empty(true)
-                    .with_prompt(prompt.to_owned() + &format!(" [{}]", capitalized_opts.join("/")))
+                    .with_prompt(prompt.to_owned() + &format!("{}", console::style(&format!(" [{}]", capitalized_opts.join("/"))).magenta()))
                     .interact()
                     .unwrap();
             }
@@ -268,7 +272,7 @@ impl MyInitExecution {
         if let Some(some_imm_value) = &var_struct.imm_value {
             // There is an immediate value defined in this VarStruct. Return it
             if let VarValue::String(_) = some_imm_value {
-                if !var_struct.do_not_format {
+                if var_struct.should_format {
                     return self.format_value(some_imm_value, entry, config, depth);
                 }
             }
@@ -303,7 +307,7 @@ impl MyInitExecution {
             "(Resolving)ShouldAutoUseDefaultValue",
             &Var::VarStruct(VarStruct {
                 ref_var: Some("ShouldAutoUseDefaultValue".into()),
-                do_not_format: false,
+                should_format: true,
                 ..Default::default()
             }),
             entry,
@@ -331,17 +335,17 @@ impl MyInitExecution {
                 .allow_empty(var_struct.default_value.is_some())
                 .with_prompt(&format!(
                     "Input value for variable {}{}{}",
-                    prompt_var_name,
+                    console::style(prompt_var_name).cyan(),
                     &if let Some(some_desc) = &var_struct.description {
                         format!(" ({})", some_desc.as_str())
                     } else {
                         "".to_owned()
                     },
-                    &if let Some(some_default_value) = &var_struct.default_value {
+                    console::style(&if let Some(some_default_value) = &var_struct.default_value {
                         format!(" [Default={}]", some_default_value)
                     } else {
                         "".to_owned()
-                    }
+                    }).magenta()
                 ))
                 .interact()
                 .unwrap();
@@ -372,7 +376,7 @@ impl MyInitExecution {
                 if s.len() == 0 || !s.ends_with("/") {
                     let ask_result = self.ask(
                         "does_not_end_with_backslash",
-                        &format!("{} does not end with a backslash. Continue?", prompt_var_name),
+                        &format!("{} does not end with a backslash. Continue?", console::style(prompt_var_name).cyan()),
                         &vec![
                             "yes",
                             "no",
@@ -388,6 +392,7 @@ impl MyInitExecution {
             }
         }
 
+        debug!("resolved {}: {}", prompt_var_name, value.to_string());
         Ok(value)
     }
 
@@ -395,12 +400,22 @@ impl MyInitExecution {
         Ok(bool::from(&self.resolve_var("DryRun",
             &Var::VarStruct(VarStruct {
                 ref_var: Some("DryRun".to_owned()),
-                do_not_format: true,
+                should_format: false,
                 ..Default::default()
             }),
             entry,
             config,
             1)?))
+    }
+
+    fn should_ask_for_confirm(&self, entry: Option<&Entry>) -> bool {
+        if let Some(Entry { should_ask_for_confirm: true, .. }) = entry {
+            return true;
+        }
+
+        self.overrides.get("ShouldAskForConfirmForAllEntries").map(|v| {
+            bool::from(v.as_imm_value().unwrap())
+        }).unwrap_or(false)
     }
 
     fn process_config(&self, config: &mut MyInitConfig, archive_path: Option<&str>) {
@@ -456,7 +471,7 @@ impl MyInitExecution {
             if *expected_user_name != current_user_name {
                 if self.ask(
                     "incorrect_user",
-                    &format!("This Configuration expects you to be user {}, but you are currently user {}. Continue?", expected_user_name, &current_user_name),
+                    &format!("This Configuration expects you to be user {}, but you are currently user {}. Continue?", console::style(expected_user_name).cyan(), console::style(&current_user_name).cyan()),
                     &vec![
                         "yes",
                         "no",
@@ -469,21 +484,25 @@ impl MyInitExecution {
         }
     }
 
-    fn unpack(&self, archive_path: &str, entry_selector: Option<&str>) -> Result<(), SimpleError> {
-        let selector = match entry_selector {
+    fn process_entry_selector(&self, entry_selector: Option<&str>) -> Result<EntrySelector, SimpleError> {
+        match entry_selector {
             Some(some_entry_selector) => {
                 if some_entry_selector.len() == 0 {
                     return Err(SimpleError::new("entry selector is an empty string"));
                 }
 
                 if some_entry_selector.chars().last().unwrap() == '/' {
-                    EntrySelector::IdPrefix(some_entry_selector.to_owned())
+                    Ok(EntrySelector::IdPrefix(some_entry_selector.to_owned()))
                 } else {
-                    EntrySelector::Id(some_entry_selector.to_owned())
+                    Ok(EntrySelector::Id(some_entry_selector.to_owned()))
                 }
             },
-            None => EntrySelector::None
-        };
+            None => Ok(EntrySelector::None)
+        }
+    }
+
+    fn unpack(&self, archive_path: &str, entry_selector: Option<&str>) -> Result<(), SimpleError> {
+        let selector = self.process_entry_selector(entry_selector)?;
 
         let (config, mut archive) =
         self.load_archive(archive_path)?;
@@ -512,7 +531,7 @@ impl MyInitExecution {
                 std::fs::create_dir_all(workspace_dir_path).map_err(to_simple_err)?;
             }
         } else {
-            println!("dry: created dir {}", workspace_dir_path.to_string_lossy());
+            blue_ln!("dry: created dir {}", workspace_dir_path.to_string_lossy());
         }
 
         // 1.2 Check existence of workspace config
@@ -538,7 +557,7 @@ impl MyInitExecution {
         if workspace_conf_not_accessable || workspace_conf_exists && !workspace_conf_is_file {
             if self.ask(
                 "_",
-                &format!("{} is not a file or cannot be accessed, so myinit cannot detect whether there is another myinit archive unpacked in your system. If you continue, current archive will forcibly unpack files in your system. Continue?", workspace_conf_path.to_string_lossy()),
+                &format!("{} is not a file or cannot be accessed, so myinit cannot detect whether there is another myinit archive unpacked in your system. If you continue, current archive will forcibly unpack files in your system. Continue?", console::style(workspace_conf_path.to_string_lossy()).cyan()),
                 &vec!["yes", "no", "exit"],
             ) != "yes" {
                 std::process::exit(1);
@@ -556,7 +575,7 @@ impl MyInitExecution {
             if !existing_archive_path.is_file() {
                 if self.ask(
                     "_",
-                    &format!("{} is not a file or cannot be accessed, so myinit cannot detect whether there is another myinit archive unpacked in your system. If you continue, current archive will forcibly unpack files in your system. Continue?", existing_archive_path.to_string_lossy()),
+                    &format!("{} is not a file or cannot be accessed, so myinit cannot detect whether there is another myinit archive unpacked in your system. If you continue, current archive will forcibly unpack files in your system. Continue?", console::style(existing_archive_path.to_string_lossy())),
                     &vec!["yes", "no", "exit"],
                 ) != "yes" {
                     std::process::exit(1);
@@ -588,11 +607,12 @@ impl MyInitExecution {
             debug!("executing entry {}", entry.name_for_human());
 
             // 2.2 Ask for confirm
-            println!("\n=======\nentry: {}", entry.name_for_human());
-            if entry.should_ask_for_confirm {
+            println!("\n=======");
+            green_ln!("entry: {}", entry.name_for_human());
+            if self.should_ask_for_confirm(Some(entry)) {
                 if self.ask(
                     "entry_ask_for_confirm",
-                    &format!("{}: apply this entry?", entry.name_for_human()),
+                    &format!("{}: apply this entry?", console::style(entry.name_for_human()).cyan()),
                     &vec!["yes", "no", "exit"]
                 ) == "no" {
                     continue;
@@ -612,7 +632,7 @@ impl MyInitExecution {
                     1
                 )?.to_string();
 
-                println!("running entry command");
+                green_ln!("running entry command");
                 if !self.is_dry_run(Some(entry), &config)? {
                     let tmp_dir = tempfile::tempdir().unwrap();
                     let tmp_fifo_path = tmp_dir.path().to_owned().join("fifo");
@@ -635,31 +655,40 @@ impl MyInitExecution {
                     }
 
                     let exit_code: std::process::ExitStatus = bash_process.wait().map_err(to_simple_err)?;
-                    if !exit_code.success() && !entry.allow_failure {
-                        return Err(SimpleError::new(&format!("{:?} returned status code {:?} or was killed by signal {:?}", command, exit_code.code(), exit_code.signal())));
+                    if !exit_code.success() {
+                        if !entry.should_allow_failure {
+                            return Err(SimpleError::new(&format!("{:?} returned status code {:?} or was killed by signal {:?}", command, exit_code.code(), exit_code.signal())));
+                        } else {
+                            red_ln!("command returned status code {:?} or was killed by signal {:?}", exit_code.code(), exit_code.signal());
+                        }
+                    } else {
+                        green_ln!("command success");
                     }
                 } else {
-                    println!("dry: run command: {}", command);
+                    blue_ln!("dry: run command: {}", command);
                 }
             } else if entry.type_ == "file" {
                 // 2.3.2 Extract files
                 for file in entry.files.as_ref().ok_or(SimpleError::new("no file list in entry while its type is file"))? {
-                    println!("unpacking: {}", file.name);
+                    green_ln!("unpacking: {}", file.name);
                     // 2.3.2.1 Get path
-                    let archive_file_path = Path::new(&self.resolve_var(
+                    let mut archive_file_path = Path::new(&self.resolve_var(
                         &format!("{}/{}:archiveDir", entry.id, file.name),
                         &file.archive_dir,
                         Some(entry),
                         &config,
                         1,
                     )?.to_string()).to_owned();
-                    let system_file_path = Path::new(&self.resolve_var(
+                    let mut system_file_path = Path::new(&self.resolve_var(
                         &format!("{}/{}:systemDir", entry.id, file.name),
                         &file.system_dir,
                         Some(entry),
                         &config,
                         1,
                     )?.to_string()).to_owned();
+
+                    archive_file_path.push(&file.name);
+                    system_file_path.push(&file.name);
 
                     enum DecidedOperation {
                         None,
@@ -677,7 +706,7 @@ impl MyInitExecution {
                     if system_file_path_no_perm {
                         if self.ask(
                             "system_file_path_no_perm",
-                            &format!("you have no access to {}. Continue?", system_file_path.to_string_lossy()),
+                            &format!("you have no access to {}. Continue?", console::style(system_file_path.to_string_lossy()).cyan()),
                             &vec!["yes", "no", "all", "nottoall", "exit"],
                         ) == "no" {
                             continue;
@@ -690,7 +719,7 @@ impl MyInitExecution {
                             if system_file_path_exists {
                                 if self.ask(
                                     "system_file_path_exists_whether_overwrite",
-                                    &format!("{} already exists, which is unexpected. Overwrite?", system_file_path.to_string_lossy()),
+                                    &format!("{} already exists, which is unexpected. Overwrite?", console::style(system_file_path.to_string_lossy()).cyan()),
                                     &vec!["yes", "no", "all", "nottoall", "exit"],
                                 ) == "no" {
                                     continue;
@@ -701,7 +730,7 @@ impl MyInitExecution {
                             if !system_file_path_exists {
                                 if self.ask(
                                     "system_file_path_not_exists",
-                                    &format!("{} does not exist, which is unexpected. Continue?", system_file_path.to_string_lossy()),
+                                    &format!("{} does not exist, which is unexpected. Continue?", console::style(system_file_path.to_string_lossy()).cyan()),
                                     &vec!["yes", "no", "all", "nottoall", "exit"],
                                 ) == "no" {
                                     continue;
@@ -794,7 +823,7 @@ impl MyInitExecution {
                                 CompareFileResult::TextNotEq => {
                                     let ask_result = self.ask(
                                         "conflict",
-                                        &format!("{} is modified since the unpack of last version. Overwrite, skip or resolve conflict?", system_file_path.to_string_lossy()),
+                                        &format!("{} is modified since the unpack of last version. Overwrite, skip or resolve conflict?", console::style(system_file_path.to_string_lossy()).cyan()),
                                         &vec![
                                             "resolve",
                                             "skip",
@@ -838,8 +867,8 @@ impl MyInitExecution {
                                         println!("executing {:?}", git_merge_cmd);
                                         let proc_exit_status = git_merge_cmd.status().map_err(to_simple_err)?;
 
-                                        if !proc_exit_status.success() {
-                                            return Err(SimpleError::new("git merge-file command did not end sucessfully"));
+                                        if proc_exit_status.signal().is_some() {
+                                            return Err(SimpleError::new("git merge-file command is interrupted by a signal"));
                                         }
 
                                         let mut vim_cmd = process::Command::new(
@@ -861,7 +890,7 @@ impl MyInitExecution {
                                 CompareFileResult::Bin => {
                                     let ask_result = self.ask(
                                         "conflict_bin",
-                                        &format!("{} is modified since the unpack of last version. Overwrite or skip?", system_file_path.to_string_lossy()),
+                                        &format!("{} is modified since the unpack of last version. Overwrite or skip?", console::style(system_file_path.to_string_lossy()).cyan()),
                                         &vec![
                                             "skip",
                                             "overwrite",
@@ -884,7 +913,7 @@ impl MyInitExecution {
                         drop(system_tmp_file);
 
                         if let Err(err) = std::fs::remove_file(&archive_old_tmp_file_path) {
-                            println!("removing {}: {:?}", archive_old_tmp_file_path.to_string_lossy(), err);
+                            green_ln!("removing {}: {:?}", archive_old_tmp_file_path.to_string_lossy(), err);
                         }
                     } else { decided_operation = DecidedOperation::Overwrite; }
 
@@ -904,44 +933,44 @@ impl MyInitExecution {
                                     ).map_err(to_simple_err)?;
                                 }
                             } else {
-                                println!("dry: created dir {}", system_dir_path.to_string_lossy());
+                                blue_ln!("dry: created dir {}", system_dir_path.to_string_lossy());
                             }
+                        }
 
+                        if !self.is_dry_run(Some(entry), &config)? {
+                            // Actually copying instead of moving
+                            std::fs::copy(overwrite_src_file_path, &system_file_path).map_err(to_simple_err)?;
+                        } else {
+                            blue_ln!("dry: moved {} to {}", overwrite_src_file_path.to_string_lossy(), system_file_path.to_string_lossy());
+                        }
+
+                        if let Some(some_mode) = mode {
                             if !self.is_dry_run(Some(entry), &config)? {
-                                // Actually copying instead of moving
-                                std::fs::copy(overwrite_src_file_path, &system_file_path).map_err(to_simple_err)?;
+                                let proc_exit_status = process::Command::new("chmod")
+                                    .arg(&format!("{:0>4o}", some_mode))
+                                    .arg(&system_file_path)
+                                    .status().map_err(to_simple_err)?;
+    
+                                if !proc_exit_status.success() {
+                                    return Err(SimpleError::new("chmod command did not end sucessfully"));
+                                }
                             } else {
-                                println!("dry: moved {} to {}", overwrite_src_file_path.to_string_lossy(), system_file_path.to_string_lossy());
+                                blue_ln!("dry: chmoded {} to {:0>4o}", system_file_path.to_string_lossy(), some_mode);
                             }
+                        }
 
-                            if let Some(some_mode) = mode {
-                                if !self.is_dry_run(Some(entry), &config)? {
-                                    let proc_exit_status = process::Command::new("chmod")
-                                        .arg(&format!("{:0>4o}", some_mode))
-                                        .arg(&system_file_path)
-                                        .status().map_err(to_simple_err)?;
-        
-                                    if !proc_exit_status.success() {
-                                        return Err(SimpleError::new("chmod command did not end sucessfully"));
-                                    }
-                                } else {
-                                    println!("dry: chmoded {} to {:0>4o}", system_file_path.to_string_lossy(), some_mode);
+                        if let Some(some_owner) = owner {
+                            if !self.is_dry_run(Some(entry), &config)? {
+                                let proc_exit_status = process::Command::new("chown")
+                                    .arg(some_owner)
+                                    .arg(&system_file_path)
+                                    .status().map_err(to_simple_err)?;
+    
+                                if !proc_exit_status.success() {
+                                    return Err(SimpleError::new("chown command did not end sucessfully"));
                                 }
-                            }
-
-                            if let Some(some_owner) = owner {
-                                if !self.is_dry_run(Some(entry), &config)? {
-                                    let proc_exit_status = process::Command::new("chown")
-                                        .arg(some_owner)
-                                        .arg(&system_file_path)
-                                        .status().map_err(to_simple_err)?;
-        
-                                    if !proc_exit_status.success() {
-                                        return Err(SimpleError::new("chown command did not end sucessfully"));
-                                    }
-                                } else {
-                                    println!("dry: chowned {} to {}", system_file_path.to_string_lossy(), some_owner);
-                                }
+                            } else {
+                                blue_ln!("dry: chowned {} to {}", system_file_path.to_string_lossy(), some_owner);
                             }
                         }
                     } else if matches!(decided_operation, DecidedOperation::Skip) {
@@ -950,12 +979,12 @@ impl MyInitExecution {
                     }
 
                     if let Err(err) = std::fs::remove_file(&archive_new_tmp_file_path) {
-                        println!("removing {}: {:?}", archive_new_tmp_file_path.to_string_lossy(), err);
+                        green_ln!("removing {}: {:?}", archive_new_tmp_file_path.to_string_lossy(), err);
                     }
 
                     if let Some(some_system_tmp_file_path) = system_tmp_file_path.as_ref() {
                         if let Err(err) = std::fs::remove_file(some_system_tmp_file_path) {
-                            println!("removing {}: {:?}", some_system_tmp_file_path.to_string_lossy(), err);
+                            green_ln!("removing {}: {:?}", some_system_tmp_file_path.to_string_lossy(), err);
                         }
                     }
                 }
@@ -984,21 +1013,23 @@ impl MyInitExecution {
                 }
             }
         } else {
-            println!("dry: extracted {} and config.yaml to workspace: {}", self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string(), workspace_dir_path.to_string_lossy());
+            blue_ln!("dry: extracted {} and config.yaml to workspace: {}", self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string(), workspace_dir_path.to_string_lossy());
         }
 
         if workspace_dir_path.absolutize().map_err(to_simple_err)? == Path::new(archive_path).absolutize().map_err(to_simple_err)? {
-            println!("skipping tar copying");
+            dark_red_ln!("skipping tar copying");
         } else {
-            let archvie_dest_path = workspace_dir_path.join(config.make_archive_filename()).to_owned();
+            let archive_dest_path = workspace_dir_path.join(config.make_archive_filename()).to_owned();
             if !self.is_dry_run(None, &config)? {
-                std::fs::copy(archive_path, &archvie_dest_path).map_err(to_simple_err)?;
+                std::fs::copy(archive_path, &archive_dest_path).map_err(to_simple_err)?;
             } else {
-                println!("dry: copied {} to {}", self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string(), archvie_dest_path.to_string_lossy());
+                blue_ln!("dry: copied {} to {}", &archive_path, archive_dest_path.to_string_lossy());
             }
         }
 
-        println!("\n=======\nfinished\n=======");
+        println!("\n=======");
+        green_ln!("finished");
+        println!("=======");
 
         Ok(())
     }
@@ -1032,14 +1063,14 @@ impl MyInitExecution {
             if entry.type_ != "file" { continue; }
 
             for file in entry.files.as_ref().ok_or(SimpleError::new("no file list in entry while its entry is file"))? {
-                let archive_file_path = Path::new(&self.resolve_var(
+                let mut archive_file_path = Path::new(&self.resolve_var(
                     &format!("{}/{}:archiveDir", entry.id, file.name),
                     &file.archive_dir,
                     Some(entry),
                     &config,
                     1,
                 )?.to_string()).to_owned();
-                let system_file_path = Path::new(&self.resolve_var(
+                let mut system_file_path = Path::new(&self.resolve_var(
                     &format!("{}/{}:systemDir", entry.id, file.name),
                     &file.system_dir,
                     Some(entry),
@@ -1047,12 +1078,16 @@ impl MyInitExecution {
                     1,
                 )?.to_string()).to_owned();
 
+                archive_file_path.push(&file.name);
+                system_file_path.push(&file.name);
+
                 if archive_file_path.starts_with(
                     self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string()
                 ) {
                     continue;
                 }
 
+                println!("opening {}...", console::style(system_file_path.to_string_lossy()).cyan());
                 let system_file = File::open(&system_file_path).map_err(to_simple_err)?;
                 let system_file_metadata = system_file_path.metadata().map_err(to_simple_err)?;
                 let mut hdr = tar::Header::new_gnu();
@@ -1076,7 +1111,8 @@ impl MyInitExecution {
                     hdr.set_groupname(g.name().to_str().unwrap()).map_err(to_simple_err)?;
                 }
 
-                println!("adding: {} -> {}", system_file_path.to_string_lossy(), archive_file_path.to_string_lossy());
+                hdr.set_cksum();
+                green_ln!("adding: {} -> {}", system_file_path.to_string_lossy(), archive_file_path.to_string_lossy());
                 archive_builder.append(&hdr, system_file).map_err(to_simple_err)?;
             }
         }
@@ -1084,6 +1120,7 @@ impl MyInitExecution {
         let extra_archive_dir =  PathBuf::from(self.consts["ExtraArchiveFilePrefix"].as_imm_value().unwrap().to_string());
 
         if extra_archive_dir.is_dir() {
+            green_ln!("adding: {}", extra_archive_dir.to_string_lossy());
             archive_builder.append_dir_all(&extra_archive_dir, &extra_archive_dir).map_err(to_simple_err)?;
         } else {
             println!("{}", console::style(
@@ -1091,8 +1128,34 @@ impl MyInitExecution {
             ).yellow());
         }
 
-        println!("adding: ./config.yaml -> config.yaml");
+        green_ln!("adding: ./config.yaml -> config.yaml");
         archive_builder.append_path_with_name("./config.yaml", "config.yaml").map_err(to_simple_err)?;
+
+        Ok(())
+    }
+
+    fn ls(&self, archive_path: &str, entry_selector: Option<&str>) -> Result<(), SimpleError> {
+        let selector = self.process_entry_selector(entry_selector)?;
+
+        let (config, _) =
+        self.load_archive(archive_path)?;
+
+        for entry in config.entries.iter() {
+            let entry: &Entry = &entry.borrow();
+            if let EntrySelector::Id(ref entry_id) = selector {
+                if entry.id != *entry_id {
+                    debug!("{} does not match the id filter {}, continue", entry.name_for_human(), entry_id);
+                    continue;
+                }
+            } else if let EntrySelector::IdPrefix(ref entry_id_prefix) = selector {
+                if !entry.id.starts_with(entry_id_prefix) {
+                    debug!("{} does not match the id prefix filter {}, continue", entry.name_for_human(), entry_id_prefix);
+                    continue;
+                }
+            }
+
+            println!("{}", entry.name_for_human());
+        }
 
         Ok(())
     }
@@ -1100,18 +1163,20 @@ impl MyInitExecution {
 
 fn print_usage(program: &str, opts: getopts::Options) {
     let brief = format!("Usage:
-        {0} unpack/u [-d/--dry] [-a/--action-auto-default] [-v/--value-auto-default] <archive>.tar.gz
-        {0} pack/p [-a/--action-auto-default] [-v/--value-auto-default]
-        
-        unpack: read the config(manifest) in <archive>.tar.gz, extract the files to the system and executed the commands
-        pack: you need to be in the workspace directory; read config.yaml in current directory, fetch needed files in current system and make an archive(.tar.gz)",
+{0} unpack/u [-d/--dry] [-a/--action-auto-default] [-v/--value-auto-default] <archive>.tar.gz
+{0} pack/p [-a/--action-auto-default] [-v/--value-auto-default]
+{0} ls/l <archive>.tar.gz
+
+unpack: read the config(manifest) in <archive>.tar.gz, extract the files to the system and executed the commands
+pack: you need to be in the workspace directory; read config.yaml in current directory, fetch needed files in current system and make an archive(.tar.gz)
+ls: read the config(manifest) in <archive>.tar.gz, list the name of the entries
+",
         program
     );
     print!("{}", opts.usage(&brief));
 }
 
 fn main() {
-    //MyInitExecution::new().print(&vec![&(String::from("Hello world!"))]);
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
 
@@ -1121,6 +1186,7 @@ fn main() {
     opts.optflag("d", "dry", "dry run - only outputs what should be done instead of actually doing them");
     opts.optflag("a", "action-auto-default", "automatically choose the default action when asked(actions are things like yes/no/overwrite etc.)");
     opts.optflag("v", "value-auto-default", "automatically choose the default value of a variable when asked for");
+    opts.optflag("c", "force-ask-for-confirm", "ask for confirm for all entries");
     opts.optflag("h", "help", "print this usage");
 
     let matches = match opts.parse(&args[1..]) {
@@ -1130,6 +1196,7 @@ fn main() {
 
     enum Command {
         Unpack(String, Option<String>),
+        Ls(String, Option<String>),
         Pack,
     };
 
@@ -1138,9 +1205,11 @@ fn main() {
         process::exit(2);
     }
 
-    let command = if matches.free.len() == 2 {
+    let command = if matches.free.len() == 3 {
         if matches.free[0] == "unpack" || matches.free[0] == "u" {
             Command::Unpack(matches.free[1].to_owned(), Some(matches.free[2].to_owned()))
+        } else if matches.free[0] == "ls" || matches.free[0] == "l" {
+            Command::Ls(matches.free[1].to_owned(), Some(matches.free[2].to_owned()))
         } else {
             print_usage(&args[0], opts);
             process::exit(2);
@@ -1148,6 +1217,8 @@ fn main() {
     } else if matches.free.len() == 2 {
         if matches.free[0] == "unpack" || matches.free[0] == "u" {
             Command::Unpack(matches.free[1].to_owned(), None)
+        } else if matches.free[0] == "ls" || matches.free[0] == "l" {
+            Command::Ls(matches.free[1].to_owned(), None)
         } else {
             print_usage(&args[0], opts);
             process::exit(2);
@@ -1170,9 +1241,13 @@ fn main() {
                 print_usage(&args[0], opts);
                 process::exit(2);
             },
+            Command::Ls(_, _) => {
+                print_usage(&args[0], opts);
+                process::exit(2);
+            },
             Command::Unpack(_, _) => {
                 mie.overrides.insert("DryRun".into(), Var::ImmValue(VarValue::Bool(true)));
-            }
+            },
         };
     }
 
@@ -1184,8 +1259,21 @@ fn main() {
         mie.overrides.insert("ShouldAutoUseDefaultValue".into(), Var::ImmValue(VarValue::Bool(true)));
     }
 
-    match command {
-        Command::Unpack(archive_path, entry_selector) => { mie.unpack(&archive_path, entry_selector.as_ref().map(|s| s.as_str())).unwrap(); },
-        Command::Pack => { mie.pack().unwrap(); },
+    if matches.opt_present("c") {
+        mie.overrides.insert("ShouldAskForConfirmForAllEntries".into(), Var::ImmValue(VarValue::Bool(true)));
     }
+
+    let result = match command {
+        Command::Unpack(archive_path, entry_selector) => { mie.unpack(&archive_path, entry_selector.as_ref().map(|s| s.as_str())) },
+        Command::Ls(archive_path, entry_selector) => { mie.ls(&archive_path, entry_selector.as_ref().map(|s| s.as_str())) },
+        Command::Pack => { mie.pack() },
+    };
+
+    match result {
+        Ok(_) => {},
+        Err(err) => {
+            red_ln!("Error occurred:");
+            red_ln!("{}", err.as_str());
+        }
+    };
 }

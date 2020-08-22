@@ -63,15 +63,15 @@ pub struct VarStruct {
 
     pub description: Option<String>,
 
-    #[serde(rename = "doNotFormat", default = "VarStruct::do_not_format_default")]
-    pub do_not_format: bool,
+    #[serde(rename = "shouldFormat", default = "VarStruct::should_format_default")]
+    pub should_format: bool,
 
     #[serde(skip)]
     pub final_value: RefCell<Option<VarValue>>,
 }
 
 impl VarStruct {
-    fn do_not_format_default() -> bool { false }
+    fn should_format_default() -> bool { true }
 }
 
 #[derive(Serialize, Deserialize, Debug, EnumAsInner)]
@@ -159,8 +159,8 @@ pub struct Entry {
     #[serde(rename = "shouldAskForConfirm", default = "Entry::should_ask_for_confirm_default")]
     pub should_ask_for_confirm: bool,
 
-    #[serde(rename = "allowFailure", default = "Entry::allow_failure_default")]
-    pub allow_failure: bool,
+    #[serde(rename = "shouldAllowFailure", default = "Entry::allow_failure_default")]
+    pub should_allow_failure: bool,
 
     pub command: Option<Var>,
 

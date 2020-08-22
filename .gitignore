@@ -1,2 +1,6 @@
 /target
 *.log
+config.yaml
+config.example.yaml
+__*/
+*.tar.gz

@@ -84,7 +84,9 @@ impl<'a> MyInitLiveArchive<'a> {
                     Err(_) => false,
                 }
             })
-            .ok_or(SimpleError::new("not found"))?
+            .ok_or(SimpleError::new(
+                &format!("not found in archive: {}", path.to_string_lossy())
+            ))?
             .unwrap()
         )
     }

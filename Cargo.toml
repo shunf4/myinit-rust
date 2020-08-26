@@ -1,8 +1,9 @@
 [package]
 name = "myinit-rust"
-version = "0.1.0"
+version = "0.1.2"
 authors = ["shunf4 <shun1048576@gmail.com>"]
 edition = "2018"
+build = "build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -33,3 +34,6 @@ nix = "^0.18.0"
 unicode_reader = "^1.0.1"
 file_diff = "^1.0.0"
 path-absolutize = "^1.0.2"
+
+[build-dependencies]
+built = { version = "^0.4", features = ["git2"] }

@@ -4,3 +4,5 @@ config.yaml
 config.example.yaml
 __*/
 *.tar.gz
+*.gz
+deploy.sh

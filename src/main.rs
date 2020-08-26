@@ -29,6 +29,10 @@ mod config;
 mod archive;
 mod util;
 
+pub mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
+}
+
 struct MyInitExecution {
     consts: HashMap<String, Var>,
     overrides: HashMap<String, Var>,
@@ -1140,6 +1144,8 @@ impl MyInitExecution {
         let (config, _) =
         self.load_archive(archive_path)?;
 
+        println!("spec version: {}", config.spec_version);
+        println!("config version: {}", config.conf_version);
         for entry in config.entries.iter() {
             let entry: &Entry = &entry.borrow();
             if let EntrySelector::Id(ref entry_id) = selector {
@@ -1154,7 +1160,7 @@ impl MyInitExecution {
                 }
             }
 
-            println!("{}", entry.name_for_human());
+            println!("- {}", entry.name_for_human());
         }
 
         Ok(())
@@ -1162,16 +1168,27 @@ impl MyInitExecution {
 }
 
 fn print_usage(program: &str, opts: getopts::Options) {
-    let brief = format!("Usage:
-{0} unpack/u [-d/--dry] [-a/--action-auto-default] [-v/--value-auto-default] <archive>.tar.gz
-{0} pack/p [-a/--action-auto-default] [-v/--value-auto-default]
-{0} ls/l <archive>.tar.gz
+    let brief = format!("myinit-rust {1}{2}{3} {4} {5} {6}
+    
+Usage:
+
+- {0} unpack/u [-d/--dry] [-a/--action-auto-default] [-v/--value-auto-default] <archive>.tar.gz
+- {0} pack/p [-a/--action-auto-default] [-v/--value-auto-default]
+- {0} ls/l <archive>.tar.gz
 
 unpack: read the config(manifest) in <archive>.tar.gz, extract the files to the system and executed the commands
 pack: you need to be in the workspace directory; read config.yaml in current directory, fetch needed files in current system and make an archive(.tar.gz)
 ls: read the config(manifest) in <archive>.tar.gz, list the name of the entries
 ",
-        program
+        program,
+        built_info::PKG_VERSION,
+        if let Some(h) = built_info::GIT_COMMIT_HASH {
+            format!("-{}", h)
+        } else { String::from("") },
+        if built_info::GIT_DIRTY.unwrap_or(false) { "(dirty)" } else { "" },
+        built_info::TARGET,
+        built_info::PROFILE,
+        built_info::PKG_AUTHORS,
     );
     print!("{}", opts.usage(&brief));
 }
@@ -1206,19 +1223,19 @@ fn main() {
     }
 
     let command = if matches.free.len() == 3 {
-        if matches.free[0] == "unpack" || matches.free[0] == "u" {
-            Command::Unpack(matches.free[1].to_owned(), Some(matches.free[2].to_owned()))
-        } else if matches.free[0] == "ls" || matches.free[0] == "l" {
-            Command::Ls(matches.free[1].to_owned(), Some(matches.free[2].to_owned()))
+        if matches.free[1] == "unpack" || matches.free[1] == "u" {
+            Command::Unpack(matches.free[0].to_owned(), Some(matches.free[2].to_owned()))
+        } else if matches.free[1] == "ls" || matches.free[1] == "l" {
+            Command::Ls(matches.free[0].to_owned(), Some(matches.free[2].to_owned()))
         } else {
             print_usage(&args[0], opts);
             process::exit(2);
         }
     } else if matches.free.len() == 2 {
-        if matches.free[0] == "unpack" || matches.free[0] == "u" {
-            Command::Unpack(matches.free[1].to_owned(), None)
-        } else if matches.free[0] == "ls" || matches.free[0] == "l" {
-            Command::Ls(matches.free[1].to_owned(), None)
+        if matches.free[1] == "unpack" || matches.free[1] == "u" {
+            Command::Unpack(matches.free[0].to_owned(), None)
+        } else if matches.free[1] == "ls" || matches.free[1] == "l" {
+            Command::Ls(matches.free[0].to_owned(), None)
         } else {
             print_usage(&args[0], opts);
             process::exit(2);

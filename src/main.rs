@@ -162,7 +162,7 @@ impl MyInitExecution {
                     // .with_initial_text(&one_letter_opts[0])
                     .allow_empty(true)
                     .with_prompt(prompt.to_owned() + &format!("{}", console::style(&format!(" [{}]", capitalized_opts.join("/"))).magenta()))
-                    .interact()
+                    .interact_text()
                     .unwrap();
             }
 
@@ -351,7 +351,7 @@ impl MyInitExecution {
                         "".to_owned()
                     }).magenta()
                 ))
-                .interact()
+                .interact_text()
                 .unwrap();
 
         if let Some(some_default_value) = &var_struct.default_value {
@@ -1172,9 +1172,9 @@ fn print_usage(program: &str, opts: getopts::Options) {
     
 Usage:
 
-- {0} unpack/u [-d/--dry] [-a/--action-auto-default] [-v/--value-auto-default] <archive>.tar.gz
-- {0} pack/p [-a/--action-auto-default] [-v/--value-auto-default]
-- {0} ls/l <archive>.tar.gz
+- {0} [-d/--dry] [-a/--action-auto-default] [-v/--value-auto-default] <archive>.tar.gz unpack/u
+- {0} [-a/--action-auto-default] [-v/--value-auto-default] pack/p
+- {0} <archive>.tar.gz ls/l
 
 unpack: read the config(manifest) in <archive>.tar.gz, extract the files to the system and executed the commands
 pack: you need to be in the workspace directory; read config.yaml in current directory, fetch needed files in current system and make an archive(.tar.gz)

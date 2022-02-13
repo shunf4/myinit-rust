@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::string::String;
-use dialoguer::{theme::{ColorfulTheme}, Input};
+use dialoguer::{theme::{ColorfulTheme}, Input, console};
 use simple_error::SimpleError;
 use log::{debug};
 use dynfmt::Format;
